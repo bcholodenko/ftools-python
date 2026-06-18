@@ -227,12 +227,14 @@ class VbfFile:
     def save_to_file(self, file_path):
         # fix header
         self.crc32 = self._calc_crc32()
-        new_crc_hex = f"{self.crc32:08X}"
 
         m = _RE_FILE_CHECKSUM.search(self.ascii_header)
         if not m:
             raise VbfError("Could not save VBF file: the ASCII header does not contain a file_checksum field.")
         old_hex = m.group(1)
+        # Preserve the original hex case (some VBFs use lowercase, others uppercase)
+        fmt = "{:08x}" if old_hex == old_hex.lower() else "{:08X}"
+        new_crc_hex = fmt.format(self.crc32)
         self.ascii_header = self.ascii_header.replace(old_hex, new_crc_hex)
 
         m2 = _RE_BYTES_LINE.search(self.ascii_header)
