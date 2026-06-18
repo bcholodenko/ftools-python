@@ -1,4 +1,4 @@
-# FTools (Python / macOS port)
+# ftools-python
 
 A from-scratch Python 3 rewrite of [FTools-5.0](https://github.com/AuRoN89/FTools),
 a toolset for unpacking and repacking the firmware of Ford IPC (instrument
