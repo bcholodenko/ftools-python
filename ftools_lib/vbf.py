@@ -72,7 +72,7 @@ class VbfFile:
                     break
         return bytes(header)
 
-    def open_file(self, file_path):
+    def open_file(self, file_path, ignore_crc_mismatch=False):
         file_path = Path(file_path)
         try:
             data = read_file(file_path)
@@ -106,7 +106,11 @@ class VbfFile:
         content = data[data_section_offset:data_section_offset + self.content_size]
         crc = _crc32_calc(content)
         if self.crc32 != crc:
-            raise VbfError("Could not parse VBF file: the binary data's CRC-32 does not match the checksum in the header.")
+            if not ignore_crc_mismatch:
+                raise VbfError("Could not parse VBF file: the binary data's CRC-32 does not match the checksum in the header.")
+            print(f"Warning: the binary data's CRC-32 (0x{crc:08x}) does not match the checksum "
+                  f"in the header (0x{self.crc32:08x}) - continuing anyway since the mismatch was "
+                  f"explicitly ignored. Saving will recalculate and write a correct checksum.")
 
         self.sections = []
         i = data_section_offset
