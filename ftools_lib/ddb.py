@@ -1,343 +1,540 @@
 """
-.ddb <-> BMP conversion for the IPC's "device-dependent bitmap" image
+.ddb <-> PNG conversion for the IPC's "device-dependent bitmap" image
 resources (found inside the QNX imagefs, e.g. images/variant/.../*.ddb).
 
-IMPORTANT - PARTIAL FORMAT SUPPORT:
+All 5 known format variants are supported and round-trip byte-for-byte
+(decode then re-encode with unedited pixels reproduces the original file
+exactly).
 
-The .ddb format is undocumented/proprietary; there is no public spec for it.
-This module supports the variants that were reverse-engineered and confirmed
-against real sample files - empirically derived from JB5T-14C088-FB.vbf, NOT
-from any official documentation. Together the two confirmed raw/raster
-variants below cover roughly 60% of the .ddb files found in a typical
-resource pack (184 of 305 in our reference sample): all full-screen
-backgrounds, popups, gradient panels, and most icons. The rest (121 of 305)
-use one of three other header signatures (format 7, 5, or 2) that show clear
-evidence of genuine RLE-style compression (same width/height pairs produce
-different file sizes depending on image complexity) and have NOT been fully
-decoded yet; attempting to read one of those raises DdbError rather than
-silently producing garbage.
-
-CONFIRMED FORMAT 1 - RAW16 (validated three ways: exact byte-count match
-across 144 real samples with zero remainder, clean visual rendering with no
-diagonal tearing, and a ground-truth color check - the warning-panel
-background_red vs background_amber samples decode to identical R/B channels
-with only G differing, exactly matching real-world red-vs-amber colour
-theory):
-
+HEADER (8 bytes, little-endian, common to all variants):
     Offset  Size  Field
-    0       2     width   (u16 LE) - visible content width, in pixels
-    2       2     height  (u16 LE) - visible content height, in pixels
-    4       1     type    - observed values: 0x02, 0x82 (0x82 = 0x02 | 0x80;
-                            the meaning of the high bit is not understood,
-                            but it doesn't affect decoding - preserved
-                            verbatim on round-trip)
-    5       1     (always observed as 0x80 - meaning unknown, preserved
-                            verbatim)
-    6       2     format  (u16 LE) - must be 4 to use this decoder
-    8       -     pixel data: raw RGB565 (5 bits R / 6 bits G / 5 bits B),
-                            2 bytes per pixel, little-endian, NO palette.
-                            Row stride is next_pow2(width) pixels (i.e. each
-                            row is padded out to the next power of two,
-                            presumably so the renderer can address rows with
-                            a bit-shift instead of a multiply). The real
-                            number of stored rows is simply
-                            (file_size - 8) // (stride_px * 2); this is
-                            usually `height + 1` but the exact reason for
-                            the extra row isn't understood, so it's always
-                            derived from the file size directly rather than
-                            assumed. Only the top-left width x height
-                            rectangle is the "visible" image - the rest is
-                            padding (columns beyond `width`, and any row(s)
-                            beyond `height`) and is preserved verbatim on
-                            round-trip rather than interpreted.
+    0       2     width      (u16) visible image width, pixels
+    2       2     height     (u16) visible image height, pixels
+    4       1     type_byte  observed: 0x02, 0x03, 0x82. High bit meaning
+                             unknown; doesn't affect decoding; preserved
+                             verbatim on round-trip.
+    5       1     byte5      always observed as 0x80; meaning unknown;
+                             preserved verbatim on round-trip.
+    6       1     format     fully determines pixel layout, compression,
+                             and presence of an alpha plane - see below.
+    7       1     always 0 (high byte of the u16 starting at offset 6;
+                             format values are all < 256)
 
-CONFIRMED FORMAT 2 - RAW24 (type byte = 0x03, format = 6; 40 files in the
-reference sample). Same padding scheme as RAW16 (row stride = next_pow2
-(width), real row count derived from file size) but 3 bytes per pixel
-(direct R,G,B, no palette) instead of 2, and an additional wrinkle: roughly
-a third of the files in this group (13 of 40) have an extra fixed 32-byte
-block between the 8-byte header and the start of pixel data, whose purpose
-isn't understood (it isn't a palette consumed by the pixel data, since the
-pixel data is direct colour, not indexed) but which is preserved verbatim on
-round-trip. There is no header field that distinguishes the with-prefix from
-without-prefix files; this module detects it from the body length (whichever
-of extra=0 / extra=32 divides the remaining body evenly into whole rows close
-to `height` is used). Validated visually on large backgrounds (popup and
-stack background panels, where wide runs of identical row bytes confirmed
-deliberate solid-colour fill regions, not corruption) and on a thin gradient
-divider bar. NOTE: a subset of small interactive icons in this group
-(checkbox/radio-button states, arrow buttons, and on/off toggle icon pairs
-such as entertainment/navigation/phone) appear to actually need 2
-bytes/pixel (RAW16-style) rather than 3, based on spot-checks, but no
-reliable automatic signal to distinguish the two sub-cases was found in the
-time available - those specific icons may show visible banding artifacts
-under this decoder. This is a known, open limitation.
+PIXEL FORMAT:
+    Each color sample is a 16-bit little-endian word:
+        bit 15      alpha flag: 1 = fully opaque, 0 = fully transparent
+                    (only meaningful for variants with no separate
+                    mask plane; otherwise ignored for rendering, but
+                    still stored data - preserved verbatim on encode)
+        bits 14-10  red   (5 bits)
+        bits 9-5    green (5 bits)
+        bits 4-0    blue  (5 bits)
+    Each 5-bit channel scales to 8-bit by multiplying by 255/31.
+
+ROW PADDING ("real width" / "real height"):
+    Pixel data is stored in a row-major grid wider than the visible
+    image: realWidth columns by realHeight rows, where only the
+    top-left width x height rectangle is the visible picture.
+        realWidth  = the smallest value in [16,32,64,128,256,512,1024]
+                     that is >= width            (format != 2)
+                   = ceil(width / 4) * 4          (format == 2 only)
+        realHeight = derived from the file size (see _raw_real_height())
+                     for the 3 raw variants, or simply equal to the
+                     declared height for the 2 RLE variants.
+    A mask/alpha plane, when present, uses its own row width:
+        maskWidth  = ceil(realWidth / 8) * 8
+
+THE 5 FORMAT VALUES (byte at header offset 6 encodes two flags):
+    rle  = (format % 2) != 0       (odd  -> PackBits-compressed)
+    mask = format in (2, 6, 7)     (has a separate alpha/mask plane)
+
+    format  rle    mask   realWidth rule
+    ------  -----  -----  ------------------
+    4       False  False  pow2-list
+    6       False  True   pow2-list
+    2       False  True   ceil(w/4)*4
+    5       True   False  pow2-list
+    7       True   True   pow2-list
+
+LAYOUT WITHIN THE FILE BODY (everything after the 8-byte header):
+    No mask  (format 4, 5):       [color plane]
+    Has mask (format 2, 6, 7):    [color plane][mask/alpha plane]
+    Not RLE  (format 2, 4, 6):    plane(s) stored raw, row-major,
+                                  row stride = realWidth * bytes-per-px
+                                  (2 for color, 1 for mask)
+    RLE      (format 5, 7):       plane(s) PackBits-compressed
+                                  independently - the mask stream starts
+                                  right after the color stream's
+                                  compressed length, not a fixed offset.
+
+PACKBITS COMPRESSION (format 5 and 7 only):
+    Two control-unit sizes are used: 16-bit units for the color plane,
+    8-bit units for the mask plane. Shown here for the 16-bit case; the
+    mask case substitutes 8-bit units and threshold 0x80 for 0x8000:
+
+        read a control u16 `g`
+        if g has its high bit set (g >= 0x8000):
+            v = 0x10000 - g                  # 1..32768
+            copy the next v raw u16 pixel values through unchanged
+        else:
+            g itself is the repeat count (0..32767)
+            repeat the single u16 pixel value that follows, g times
+
+    Decoding stops once realWidth*realHeight (color) or
+    realWidth*realHeight (mask) target units have been produced; the
+    mask stream then starts at the byte offset where the color stream's
+    compressed data ended.
+
+    The encoder side (_rle_encode_words/_rle_encode_bytes) reproduces the
+    exact run/literal boundary choices needed for byte-identical
+    round-trip: scanning left to right, pixels accumulate in a literal
+    buffer; when a pixel equals its successor, that pixel joins the
+    literal buffer (if non-empty) and the buffer flushes, with the repeat
+    run measured starting at the successor; if that run is only 1 long,
+    no repeat is emitted (it would cost more than it saves) and the lone
+    pixel instead starts a new literal buffer. When the literal buffer is
+    empty at the point a match is found, the run is measured directly at
+    the current pixel with no absorption. A lone trailing pixel at the
+    very end of the stream with no pending literal is emitted as a
+    repeat of length 1.
 """
 
 import struct
-from pathlib import Path
 
-from . import bmpio
 from .utils import read_file, write_file
 
-DDB_SUPPORTED_FORMAT = 4
-DDB_RAW24_FORMAT = 6
-DDB_RAW24_EXTRA_CANDIDATES = (0, 32)
 DDB_HEADER_SIZE = 8
-
 _HEADER_FMT = "<HHBBH"
+
+_POW2_WIDTHS = (16, 32, 64, 128, 256, 512, 1024)
+_CHANNEL_SCALE = 255 / 31  # 5-bit -> 8-bit
 
 
 class DdbError(RuntimeError):
     pass
 
 
-def _next_pow2(n: int) -> int:
-    p = 1
-    while p < n:
-        p *= 2
-    return p
-
-
 def _parse_header(data: bytes, context: str = "") -> dict:
     if len(data) < DDB_HEADER_SIZE:
         raise DdbError(f"'{context}': too short to be a .ddb file ({len(data)} bytes).")
-
-    width, height, type_byte, byte5, fmt = struct.unpack_from(_HEADER_FMT, data, 0)
-
+    width, height, type_byte, byte5, fmt_u16 = struct.unpack_from(_HEADER_FMT, data, 0)
+    fmt = fmt_u16 & 0xFF
+    if fmt_u16 > 0xFF:
+        raise DdbError(f"'{context}': unexpected format value 0x{fmt_u16:04x} (high byte set).")
     if width == 0 or height == 0:
         raise DdbError(f"'{context}': implausible .ddb header (width={width}, height={height}).")
-
     return {
-        "width": width,
-        "height": height,
-        "type_byte": type_byte,
-        "byte5": byte5,
+        "width": width, "height": height,
+        "type_byte": type_byte, "byte5": byte5,
         "format": fmt,
+        "rle": (fmt % 2) != 0,
+        "mask": fmt in (2, 6, 7),
     }
 
 
-def _is_raw16(hdr: dict) -> bool:
-    return hdr["format"] == DDB_SUPPORTED_FORMAT and (hdr["type_byte"] & 0x7F) == 2
+def _real_width(fmt: int, width: int) -> int:
+    if fmt == 2:
+        return ((width + 3) // 4) * 4
+    for w in _POW2_WIDTHS:
+        if w >= width:
+            return w
+    raise DdbError(f"width {width} exceeds the largest supported real-width candidate (1024).")
 
 
-def _is_raw24(hdr: dict) -> bool:
-    return hdr["format"] == DDB_RAW24_FORMAT and hdr["type_byte"] == 3
+def _mask_width(real_width: int) -> int:
+    return ((real_width + 7) // 8) * 8
 
 
-def _raw24_find_extra(body: bytes, width: int, height: int) -> int:
-    """Determine the RAW24 prefix size (0 or 32 bytes) for this body, by
-    finding whichever candidate divides the remaining bytes evenly into a
-    whole number of stride_bytes-sized rows, with that row count close to
-    `height`. Raises DdbError if neither candidate fits."""
-    stride_bytes = _next_pow2(width) * 3
-    for extra in DDB_RAW24_EXTRA_CANDIDATES:
-        if len(body) <= extra:
-            continue
-        remainder_body = body[extra:]
-        if stride_bytes and len(remainder_body) % stride_bytes == 0:
-            rows = len(remainder_body) // stride_bytes
-            if height <= rows <= height + 1:
-                return extra
-    raise DdbError(
-        "RAW24 .ddb body length doesn't cleanly divide into rows for any "
-        "known prefix size (0 or 32 bytes) - this file may be corrupt, or "
-        "use a variant of this format not yet seen."
-    )
+def _raw_real_height(fmt: int, width: int, height: int, real_width: int, file_size: int) -> tuple:
+    """Derive (color_real_height, mask_real_height) for the 3 non-RLE
+    formats (2, 4, 6) from the file size. When the simple division isn't
+    an integer, the mask plane's row count gets a "+1"/"+2" adjustment
+    preferentially while the color plane keeps the unadjusted value -
+    they are not always equal."""
+    body_size = file_size - DDB_HEADER_SIZE
+    s = real_width
+    if fmt == 4:
+        c = body_size / s / 2
+        if c == int(c) and int(c) >= height:
+            return int(c), int(c)
+        raise DdbError(f"format 4: body size {body_size} doesn't divide evenly by row stride {s*2}.")
 
+    o = _mask_width(s)
+    max_extra = 1 if fmt == 2 else 2
+    c = body_size / (2 * s + o)
+    d = None
+    for extra in range(1, max_extra + 1):
+        if c == int(c):
+            break
+        c = (body_size - extra * o) / (2 * s + o)
+        d = c + extra
+    if c != int(c):
+        raise DdbError(
+            f"format {fmt}: body size {body_size} doesn't fit the expected row layout "
+            f"(realWidth={s}, maskWidth={o}) for 0..{max_extra} extra padding chunks."
+        )
+    color_h = int(c)
+    mask_h = int(d) if d is not None else color_h
+    if color_h < height:
+        raise DdbError(f"format {fmt}: derived color real-height {color_h} is less than declared height {height}.")
+    return color_h, mask_h
+
+
+# ── PackBits-style RLE (formats 5, 7) ──────────────────────────────────────────
+
+def _rle_decode_words(data: bytes, target_bytes: int) -> tuple:
+    """Decode the 16-bit-unit PackBits stream used for the color plane.
+    Returns (decoded_bytes, bytes_consumed_from_input)."""
+    out = bytearray()
+    c = 0
+    n = len(data)
+    while c < n and len(out) < target_bytes:
+        if c + 1 >= n:
+            break
+        g = data[c] | (data[c + 1] << 8)
+        c += 2
+        if g & 0x8000:
+            v = 0x10000 - g
+            for _ in range(v):
+                if c + 1 >= n:
+                    break
+                out.append(data[c]); out.append(data[c + 1])
+                c += 2
+        else:
+            if c + 1 >= n:
+                break
+            b0, b1 = data[c], data[c + 1]
+            for _ in range(g):
+                out.append(b0); out.append(b1)
+            c += 2
+    return bytes(out[:target_bytes]), c
+
+
+def _rle_decode_bytes(data: bytes, target_bytes: int) -> bytes:
+    """Decode the 8-bit-unit PackBits stream used for the mask plane."""
+    out = bytearray()
+    d = 0
+    n = len(data)
+    while d < n and len(out) < target_bytes:
+        f = data[d]
+        d += 1
+        if f & 0x80:
+            g = 256 - f
+            for _ in range(g):
+                if d >= n:
+                    break
+                out.append(data[d]); d += 1
+        else:
+            if d >= n:
+                break
+            b0 = data[d]
+            for _ in range(f):
+                out.append(b0)
+            d += 1
+    return bytes(out[:target_bytes])
+
+
+def _rle_encode_words(pixel_bytes: bytes) -> bytes:
+    """PackBits-style encoder for the 16-bit-unit color stream. See the
+    module docstring for the exact run/literal boundary rules."""
+    n_units = len(pixel_bytes) // 2
+    units = struct.unpack(f"<{n_units}H", pixel_bytes) if n_units else ()
+    out = bytearray()
+    literal_buf = []
+
+    def flush():
+        if literal_buf:
+            out.extend(struct.pack("<H", 0x10000 - len(literal_buf)))
+            for v in literal_buf:
+                out.extend(struct.pack("<H", v))
+            literal_buf.clear()
+
+    i = 0
+    while i < n_units:
+        if i + 1 < n_units and units[i] == units[i + 1]:
+            if literal_buf:
+                literal_buf.append(units[i])
+                flush()
+                run_start = i + 1
+            else:
+                run_start = i
+            run_len = 1
+            while (run_start + run_len < n_units
+                   and units[run_start + run_len] == units[run_start]
+                   and run_len < 32767):
+                run_len += 1
+            if run_len >= 2:
+                out.extend(struct.pack("<H", run_len))
+                out.extend(struct.pack("<H", units[run_start]))
+                i = run_start + run_len
+            else:
+                literal_buf.append(units[run_start])
+                i = run_start + 1
+        elif i == n_units - 1 and not literal_buf:
+            out.extend(struct.pack("<H", 1))
+            out.extend(struct.pack("<H", units[i]))
+            i += 1
+        else:
+            literal_buf.append(units[i])
+            if len(literal_buf) >= 32768:
+                flush()
+            i += 1
+    flush()
+    return bytes(out)
+
+
+def _rle_encode_bytes(data: bytes) -> bytes:
+    """PackBits-style encoder for the 8-bit-unit mask stream, same
+    scan/flush behavior as _rle_encode_words()."""
+    n = len(data)
+    out = bytearray()
+    literal_buf = []
+
+    def flush():
+        if literal_buf:
+            out.append(256 - len(literal_buf))
+            out.extend(literal_buf)
+            literal_buf.clear()
+
+    i = 0
+    while i < n:
+        if i + 1 < n and data[i] == data[i + 1]:
+            if literal_buf:
+                literal_buf.append(data[i])
+                flush()
+                run_start = i + 1
+            else:
+                run_start = i
+            run_len = 1
+            while (run_start + run_len < n
+                   and data[run_start + run_len] == data[run_start]
+                   and run_len < 127):
+                run_len += 1
+            if run_len >= 2:
+                out.append(run_len)
+                out.append(data[run_start])
+                i = run_start + run_len
+            else:
+                literal_buf.append(data[run_start])
+                i = run_start + 1
+        elif i == n - 1 and not literal_buf:
+            out.append(1)
+            out.append(data[i])
+            i += 1
+        else:
+            literal_buf.append(data[i])
+            if len(literal_buf) >= 128:
+                flush()
+            i += 1
+    flush()
+    return bytes(out)
+
+
+# ── pixel <-> RGBA ──────────────────────────────────────────────────────────────
+
+def _word_to_rgb(val: int) -> tuple:
+    r = round(((val >> 10) & 0x1F) * _CHANNEL_SCALE)
+    g = round(((val >> 5) & 0x1F) * _CHANNEL_SCALE)
+    b = round((val & 0x1F) * _CHANNEL_SCALE)
+    return r, g, b
+
+
+def _rgb_to_word(r: int, g: int, b: int) -> int:
+    r5 = round(r / _CHANNEL_SCALE)
+    g5 = round(g / _CHANNEL_SCALE)
+    b5 = round(b / _CHANNEL_SCALE)
+    return ((r5 & 0x1F) << 10) | ((g5 & 0x1F) << 5) | (b5 & 0x1F)
+
+
+# ── public API ──────────────────────────────────────────────────────────────────
 
 def is_supported_ddb(data: bytes) -> bool:
-    """Return True if `data` looks like one of the confirmed, decodable .ddb
-    variants (RAW16 or RAW24 - see module docstring)."""
+    """Return True if `data` is a decodable .ddb file."""
     try:
         hdr = _parse_header(data)
     except DdbError:
         return False
-    if _is_raw16(hdr):
+    if hdr["format"] not in (2, 4, 5, 6, 7):
+        return False
+    try:
+        s = _real_width(hdr["format"], hdr["width"])
+        if not hdr["rle"]:
+            _raw_real_height(hdr["format"], hdr["width"], hdr["height"], s, len(data))
         return True
-    if _is_raw24(hdr):
-        try:
-            _raw24_find_extra(data[DDB_HEADER_SIZE:], hdr["width"], hdr["height"])
-        except DdbError:
-            return False
-        return True
-    return False
-
-
-def _decode_raw16(data: bytes, hdr: dict, context: str) -> dict:
-    width, height = hdr["width"], hdr["height"]
-    stride_px = _next_pow2(width)
-    stride_bytes = stride_px * 2
-    body = data[DDB_HEADER_SIZE:]
-
-    if len(body) % stride_bytes != 0:
-        raise DdbError(
-            f"'{context}': pixel data length ({len(body)} bytes) is not an exact "
-            f"multiple of the expected row stride ({stride_bytes} bytes) - this "
-            f"file may be corrupt or not actually this .ddb variant."
-        )
-
-    real_rows = len(body) // stride_bytes
-    if real_rows < height:
-        raise DdbError(
-            f"'{context}': declared height ({height}) exceeds the number of rows "
-            f"actually present in the file ({real_rows})."
-        )
-
-    rgba = bytearray(width * height * 4)
-    for row in range(height):
-        row_off = row * stride_bytes
-        row_pixels = struct.unpack_from(f"<{width}H", body, row_off)
-        out_off = row * width * 4
-        for col, val in enumerate(row_pixels):
-            r = (val >> 11) & 0x1F
-            g = (val >> 5) & 0x3F
-            b = val & 0x1F
-            o = out_off + col * 4
-            rgba[o] = (r * 255) // 31
-            rgba[o + 1] = (g * 255) // 63
-            rgba[o + 2] = (b * 255) // 31
-            rgba[o + 3] = 0xFF
-
-    return {"width": width, "height": height, "rgba": bytes(rgba)}
-
-
-def _decode_raw24(data: bytes, hdr: dict, context: str) -> dict:
-    width, height = hdr["width"], hdr["height"]
-    body = data[DDB_HEADER_SIZE:]
-    extra = _raw24_find_extra(body, width, height)
-    body = body[extra:]
-    stride_bytes = _next_pow2(width) * 3
-
-    rgba = bytearray(width * height * 4)
-    for row in range(height):
-        row_off = row * stride_bytes
-        out_off = row * width * 4
-        for col in range(width):
-            o = row_off + col * 3
-            r, g, b = body[o], body[o + 1], body[o + 2]
-            oo = out_off + col * 4
-            rgba[oo] = r
-            rgba[oo + 1] = g
-            rgba[oo + 2] = b
-            rgba[oo + 3] = 0xFF
-
-    return {"width": width, "height": height, "rgba": bytes(rgba)}
+    except DdbError:
+        return False
 
 
 def decode_ddb(data: bytes, context: str = "<ddb data>") -> dict:
-    """Decode a confirmed-format .ddb buffer (RAW16 or RAW24 - see module
-    docstring for both).
+    """Decode a .ddb buffer to RGBA pixel data.
 
-    Returns {"width", "height", "rgba"} where `rgba` is width*height*4 bytes,
-    top-down, RGBA order (alpha always 0xFF - neither confirmed format has
-    an alpha channel), cropped to the visible width x height rectangle.
-
-    Raises DdbError if `data` is not one of the confirmed, decodable .ddb
-    variants (e.g. one of the other header signatures that this module
-    doesn't support - see the module docstring).
+    Returns {"width", "height", "rgba"} where rgba is width*height*4 bytes,
+    top-down, R/G/B/A order, cropped to the visible width x height rectangle.
     """
     hdr = _parse_header(data, context)
+    fmt, width, height = hdr["format"], hdr["width"], hdr["height"]
+    if fmt not in (2, 4, 5, 6, 7):
+        raise DdbError(
+            f"'{context}': unrecognized .ddb format byte {fmt} "
+            f"(known values: 2, 4, 5, 6, 7)."
+        )
 
-    if _is_raw16(hdr):
-        return _decode_raw16(data, hdr, context)
-    if _is_raw24(hdr):
-        return _decode_raw24(data, hdr, context)
+    body = data[DDB_HEADER_SIZE:]
+    s = _real_width(fmt, width)
+    m = _mask_width(s)
 
-    raise DdbError(
-        f"'{context}': this .ddb uses an unrecognized/unsupported variant "
-        f"(type=0x{hdr['type_byte']:02x}, format={hdr['format']}). Only the "
-        f"raw-16bpp variant (type byte's low 7 bits = 2, format = 4) and the "
-        f"raw-24bpp variant (type byte = 3, format = 6) are currently "
-        f"supported - see ftools_lib/ddb.py for details."
-    )
+    if hdr["rle"]:
+        real_h = height
+        color_target = s * real_h * 2
+        color_plane, consumed = _rle_decode_words(body, color_target)
+        if len(color_plane) != color_target:
+            raise DdbError(f"'{context}': RLE color stream decoded short "
+                            f"({len(color_plane)}/{color_target} bytes).")
+        mask_plane = b""
+        if hdr["mask"]:
+            mask_target = m * real_h
+            mask_plane = _rle_decode_bytes(body[consumed:], mask_target)
+            if len(mask_plane) != mask_target:
+                raise DdbError(f"'{context}': RLE mask stream decoded short "
+                                f"({len(mask_plane)}/{mask_target} bytes).")
+    else:
+        color_h, mask_h = _raw_real_height(fmt, width, height, s, len(data))
+        color_target = s * color_h * 2
+        color_plane = body[:color_target]
+        if len(color_plane) < color_target:
+            raise DdbError(f"'{context}': file too short for color plane "
+                            f"({len(color_plane)}/{color_target} bytes).")
+        mask_plane = b""
+        if hdr["mask"]:
+            mask_target = m * mask_h
+            mask_plane = body[color_target:color_target + mask_target]
+            if len(mask_plane) < mask_target:
+                raise DdbError(f"'{context}': file too short for mask plane "
+                                f"({len(mask_plane)}/{mask_target} bytes).")
 
-
-def _encode_raw16(original_data: bytes, hdr: dict, rgba: bytes, width: int, height: int) -> bytes:
-    stride_px = _next_pow2(width)
-    stride_bytes = stride_px * 2
-    body = bytearray(original_data[DDB_HEADER_SIZE:])  # start from donor, preserves padding
-
+    rgba = bytearray(width * height * 4)
     for row in range(height):
-        row_off = row * stride_bytes
-        in_off = row * width * 4
-        packed = []
-        for col in range(width):
-            o = in_off + col * 4
-            r8, g8, b8 = rgba[o], rgba[o + 1], rgba[o + 2]
-            r5 = (r8 * 31 + 127) // 255
-            g6 = (g8 * 63 + 127) // 255
-            b5 = (b8 * 31 + 127) // 255
-            packed.append((r5 << 11) | (g6 << 5) | b5)
-        struct.pack_into(f"<{width}H", body, row_off, *packed)
+        c_row_off = row * s * 2
+        m_row_off = row * m
+        out_off = row * width * 4
+        row_words = struct.unpack_from(f"<{width}H", color_plane, c_row_off)
+        for col, val in enumerate(row_words):
+            r, g, b = _word_to_rgb(val)
+            if hdr["mask"]:
+                a = mask_plane[m_row_off + col]
+            else:
+                a = 0xFF if (val & 0x8000) else 0x00
+            o = out_off + col * 4
+            rgba[o] = r; rgba[o + 1] = g; rgba[o + 2] = b; rgba[o + 3] = a
 
-    return bytes(original_data[:DDB_HEADER_SIZE]) + bytes(body)
-
-
-def _encode_raw24(original_data: bytes, hdr: dict, rgba: bytes, width: int, height: int) -> bytes:
-    extra = _raw24_find_extra(original_data[DDB_HEADER_SIZE:], width, height)
-    prefix = original_data[DDB_HEADER_SIZE:DDB_HEADER_SIZE + extra]
-    stride_bytes = _next_pow2(width) * 3
-    body = bytearray(original_data[DDB_HEADER_SIZE + extra:])  # donor, preserves padding
-
-    for row in range(height):
-        row_off = row * stride_bytes
-        in_off = row * width * 4
-        for col in range(width):
-            o = in_off + col * 4
-            oo = row_off + col * 3
-            body[oo] = rgba[o]
-            body[oo + 1] = rgba[o + 1]
-            body[oo + 2] = rgba[o + 2]
-
-    return bytes(original_data[:DDB_HEADER_SIZE]) + bytes(prefix) + bytes(body)
+    return {"width": width, "height": height, "rgba": bytes(rgba)}
 
 
-def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int, context: str = "<ddb data>") -> bytes:
-    """Re-encode pixel data back into .ddb format, using `original_data` (a
-    real, confirmed-format .ddb file) as a donor for the header bytes and any
-    padding region (columns beyond `width`, rows beyond `height`, and any
-    RAW24 prefix block), which are preserved verbatim rather than
-    regenerated.
+def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
+               context: str = "<ddb data>") -> bytes:
+    """Re-encode RGBA pixel data back into .ddb format.
 
-    `width`/`height` must exactly match the original file's declared
-    dimensions - this rebuilds the SAME image at the SAME size with new
-    pixel content; it does not support resizing.
+    Uses `original_data` (a real .ddb file) as a donor for the header and
+    any padding columns/rows beyond the visible width x height rectangle,
+    which are preserved verbatim. `width`/`height` must match the donor
+    exactly - resizing isn't supported. `rgba` must be width*height*4
+    bytes, top-down, R/G/B/A order.
 
-    `rgba` must be width*height*4 bytes, top-down, RGBA order (alpha is
-    ignored - neither confirmed format has an alpha channel).
+    Unedited pixels round-trip to a byte-identical file, including for
+    the RLE formats (5, 7), since the encoder reproduces the original
+    compressor's exact run/literal choices.
     """
     hdr = _parse_header(original_data, context)
-    is16 = _is_raw16(hdr)
-    is24 = _is_raw24(hdr)
-    if not (is16 or is24):
-        raise DdbError(
-            f"'{context}': the original .ddb donor uses an unsupported variant; "
-            f"cannot re-encode."
-        )
+    fmt = hdr["format"]
+    if fmt not in (2, 4, 5, 6, 7):
+        raise DdbError(f"'{context}': donor .ddb uses an unsupported format byte {fmt}.")
     if width != hdr["width"] or height != hdr["height"]:
         raise DdbError(
-            f"'{context}': new image is {width}x{height} but the original .ddb is "
-            f"{hdr['width']}x{hdr['height']}. Resizing is not supported - the "
-            f"replacement image must be exactly the same dimensions."
+            f"'{context}': new image is {width}x{height} but donor is "
+            f"{hdr['width']}x{hdr['height']}. Resizing is not supported."
         )
     if len(rgba) != width * height * 4:
         raise DdbError(f"'{context}': RGBA buffer size does not match width*height*4.")
 
-    if is16:
-        return _encode_raw16(original_data, hdr, rgba, width, height)
-    return _encode_raw24(original_data, hdr, rgba, width, height)
+    body = original_data[DDB_HEADER_SIZE:]
+    s = _real_width(fmt, width)
+    m = _mask_width(s)
+
+    if hdr["rle"]:
+        real_h = height
+        color_target = s * real_h * 2
+        donor_color, consumed = _rle_decode_words(body, color_target)
+        mask_plane = bytearray()
+        if hdr["mask"]:
+            mask_target = m * real_h
+            mask_plane[:] = _rle_decode_bytes(body[consumed:], mask_target)
+    else:
+        color_h, mask_h = _raw_real_height(fmt, width, height, s, len(original_data))
+        color_target = s * color_h * 2
+        donor_color = body[:color_target]
+        mask_plane = bytearray()
+        if hdr["mask"]:
+            mask_target = m * mask_h
+            mask_plane[:] = body[color_target:color_target + mask_target]
+
+    color_plane = bytearray(donor_color)
+    for row in range(height):
+        c_row_off = row * s * 2
+        m_row_off = row * m
+        in_off = row * width * 4
+        words = []
+        for col in range(width):
+            o = in_off + col * 4
+            r, g, b, a = rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]
+            val = _rgb_to_word(r, g, b)
+            if hdr["mask"]:
+                # bit15 is unused for transparency here but still stored;
+                # preserve the donor's bit so unedited pixels round-trip exactly.
+                donor_word = struct.unpack_from("<H", donor_color, c_row_off + col * 2)[0]
+                val |= (donor_word & 0x8000)
+                mask_plane[m_row_off + col] = a
+            else:
+                if a >= 0x80:
+                    val |= 0x8000
+                else:
+                    val &= 0x7FFF
+            words.append(val)
+        struct.pack_into(f"<{width}H", color_plane, c_row_off, *words)
+
+    if hdr["rle"]:
+        new_body = bytearray(_rle_encode_words(bytes(color_plane)))
+        if hdr["mask"]:
+            new_body += _rle_encode_bytes(bytes(mask_plane))
+    else:
+        new_body = bytearray(color_plane)
+        if hdr["mask"]:
+            new_body += mask_plane
+        consumed_total = len(new_body)
+        if len(body) > consumed_total:
+            new_body += body[consumed_total:]
+
+    return original_data[:DDB_HEADER_SIZE] + bytes(new_body)
 
 
-def ddb_to_bmp_file(ddb_data: bytes, out_path, context: str = "") -> None:
+# ── file-level helpers ────────────────────────────────────────────────────────
+
+def ddb_to_png_file(ddb_data: bytes, out_path, context: str = "") -> None:
+    """Decode a .ddb buffer and write a PNG file, preserving transparency."""
+    from PIL import Image
     decoded = decode_ddb(ddb_data, context=context or str(out_path))
-    bmpio.write_bmp(out_path, decoded["width"], decoded["height"], decoded["rgba"], bit_depth=32)
+    img = Image.frombytes("RGBA", (decoded["width"], decoded["height"]), decoded["rgba"])
+    img.save(str(out_path), "PNG")
 
 
-def bmp_file_to_ddb_file(bmp_path, original_ddb_path, out_path) -> None:
-    bmp = bmpio.read_bmp(bmp_path)
+def png_file_to_ddb_file(png_path, original_ddb_path, out_path) -> None:
+    """Read a PNG (including its alpha channel) and encode it back to
+    .ddb using the original as a donor for header/padding bytes."""
+    from PIL import Image
+    img = Image.open(png_path).convert("RGBA")
+    rgba = img.tobytes()
     original_data = read_file(original_ddb_path)
     new_ddb = encode_ddb(
-        original_data, bmp["rgba"], bmp["width"], bmp["height"], context=str(original_ddb_path)
+        original_data, rgba, img.width, img.height,
+        context=str(original_ddb_path)
     )
     write_file(out_path, new_ddb)
