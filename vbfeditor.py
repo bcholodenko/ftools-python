@@ -30,6 +30,9 @@ def build_parser():
     p.add_argument("-i", "--input", help="Input file")
     p.add_argument("input_pos", nargs="?", default=None, help=argparse.SUPPRESS)
     p.add_argument("-o", "--output", default="", help="Output directory")
+    p.add_argument("--ignore-crc", action="store_true",
+                   help="Continue even if the VBF's stored CRC-32 doesn't match its actual "
+                        "content - prints a warning instead of stopping")
     return p
 
 
@@ -61,7 +64,7 @@ def main():
     if args.unpack:
         vbf = VbfFile()
         try:
-            vbf.open_file(input_path)
+            vbf.open_file(input_path, ignore_crc_mismatch=args.ignore_crc)
         except VbfError as e:
             print(f"Error opening VBF file: {e}")
             return 0
@@ -77,7 +80,7 @@ def main():
     if args.info:
         vbf = VbfFile()
         try:
-            vbf.open_file(input_path)
+            vbf.open_file(input_path, ignore_crc_mismatch=args.ignore_crc)
         except VbfError as e:
             print(f"Error opening VBF file: {e}")
             return 0
