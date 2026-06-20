@@ -25,7 +25,7 @@ Section types detected and what gets unpacked:
   imagefs  (gzip+tar wrapped or raw QNX imagefs blob)
     files/                         ← all imagefs files laid out as real paths
       images/variant/.../foo.ddb   ← original .ddb (always kept for roundtrip)
-      images/variant/.../foo.bmp   ← decoded BMP for editing (supported formats only)
+      images/variant/.../foo.png   ← decoded PNG for editing
     imagefs_config.json            ← imagefs metadata (required by pack)
     wrapping.json                  ← gzip+tar wrapper metadata (required by pack)
 
@@ -46,7 +46,7 @@ Section types detected and what gets unpacked:
     data.bin                       ← verbatim binary dump
 
 Editing workflow:
-  - imagefs .ddb files: edit the .bmp; pack uses it automatically if newer
+  - imagefs .ddb files: edit the .png; pack uses it automatically if newer
     than the .ddb, otherwise the original .ddb passes through unchanged.
   - imgsection images: drop replacement .bmp/.ttf into custom/; pack picks
     them up from there (same as imgunpacker.py's workflow).
@@ -127,9 +127,9 @@ def _unpack_imagefs(section_idx: int, raw: bytes, section_dir: Path, verbose: bo
     with open(wrap_path, "w") as f:
         json.dump({"section_index": section_idx, "wrap": wrap_info}, f, indent=2)
 
-    # Convert supported .ddb files to .bmp alongside the originals.
-    # Set the .bmp mtime one second BEHIND the .ddb so that pack's
-    # "bmp newer than ddb?" test correctly treats a freshly-unpacked,
+    # Convert supported .ddb files to .png alongside the originals.
+    # Set the .png mtime one second BEHIND the .ddb so that pack's
+    # "png newer than ddb?" test correctly treats a freshly-unpacked,
     # unedited workspace as a no-op.
     ddb_converted = 0
     ddb_skipped = 0
@@ -140,14 +140,11 @@ def _unpack_imagefs(section_idx: int, raw: bytes, section_dir: Path, verbose: bo
             ddb_skipped += 1
             continue
         try:
-            decoded = ddbmod.decode_ddb(ddb_data, context=str(ddb_path))
-            bmp_path = ddb_path.with_suffix(".bmp")
-            import ftools_lib.bmpio as bmpio
-            bmpio.write_bmp(bmp_path, decoded["width"], decoded["height"],
-                            decoded["rgba"], bit_depth=32)
-            # Backdate the .bmp so pack treats it as older than the .ddb
+            png_path = ddb_path.with_suffix(".png")
+            ddbmod.ddb_to_png_file(ddb_data, png_path, context=str(ddb_path))
+            # Backdate the .png so pack treats it as older than the .ddb
             ddb_mtime = ddb_path.stat().st_mtime
-            os.utime(bmp_path, (ddb_mtime - 1, ddb_mtime - 1))
+            os.utime(png_path, (ddb_mtime - 1, ddb_mtime - 1))
             ddb_converted += 1
         except ddbmod.DdbError as e:
             if verbose:
@@ -157,7 +154,7 @@ def _unpack_imagefs(section_idx: int, raw: bytes, section_dir: Path, verbose: bo
     kind = "gzip+tar+imagefs" if wrap_info else "imagefs"
     n_files = len(ifs.list_files())
     print(f"  section {section_idx:2d}  [{kind}]  {n_files} files, "
-          f"{ddb_converted} .ddb→.bmp, {ddb_skipped} .ddb unsupported")
+          f"{ddb_converted} .ddb→.png, {ddb_skipped} .ddb unsupported")
 
     return {
         "section_index": section_idx,
@@ -264,10 +261,9 @@ def _unpack_raw(section_idx: int, raw: bytes, section_dir: Path) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
-    """Repack an imagefs section, converting any edited .bmp files back to
-    .ddb first (using the original .ddb as a donor for header/padding).
-    Files without a corresponding .bmp, or with an unsupported .ddb, pass
-    through unchanged."""
+    """Repack an imagefs section, converting any edited .png files back to
+    .ddb first. Files without a corresponding .png, or with an unsupported
+    .ddb, pass through unchanged."""
     section_idx = entry["section_index"]
     section_dir = workspace / entry["dir"]
     files_dir = section_dir / "files"
@@ -277,36 +273,30 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
         wrapping = json.load(f)
     wrap_info = wrapping["wrap"]
 
-    # Re-encode any .bmp files that are newer than their .ddb counterpart
+    # Re-encode any .png files that are newer than their .ddb counterpart
     encoded = 0
-    for bmp_path in sorted(files_dir.rglob("*.bmp")):
-        ddb_path = bmp_path.with_suffix(".ddb")
+    for png_path in sorted(files_dir.rglob("*.png")):
+        ddb_path = png_path.with_suffix(".ddb")
         if not ddb_path.exists():
-            print(f"    WARNING: {bmp_path.name} has no matching .ddb — skipping")
+            print(f"    WARNING: {png_path.name} has no matching .ddb — skipping")
             continue
-        bmp_mtime = bmp_path.stat().st_mtime
-        ddb_mtime = ddb_path.stat().st_mtime
-        if bmp_mtime <= ddb_mtime:
-            continue  # .bmp not newer — .ddb is authoritative, no re-encode needed
+        if png_path.stat().st_mtime <= ddb_path.stat().st_mtime:
+            continue  # .png not newer — .ddb is authoritative, no re-encode needed
         ddb_data = read_file(ddb_path)
         if not ddbmod.is_supported_ddb(ddb_data):
             print(f"    WARNING: {ddb_path.name} is unsupported format — "
-                  f"cannot re-encode from .bmp, using original .ddb")
+                  f"cannot re-encode from .png, using original .ddb")
             continue
-        import ftools_lib.bmpio as bmpio
-        bmp = bmpio.read_bmp(bmp_path)
-        original_ddb_data = read_file(ddb_path)
         try:
-            new_ddb = ddbmod.encode_ddb(
-                original_ddb_data, bmp["rgba"], bmp["width"], bmp["height"],
-                context=str(ddb_path))
-            write_file(ddb_path, new_ddb)
+            ddbmod.png_file_to_ddb_file(png_path, ddb_path, ddb_path)
             encoded += 1
-            print(f"    re-encoded {ddb_path.name} from .bmp")
+            print(f"    re-encoded {ddb_path.name} from .png")
         except ddbmod.DdbError as e:
             print(f"    WARNING: could not re-encode {ddb_path.name}: {e}")
 
-    # Now (re-)import the imagefs from disk, compare to original, rebuild if changed
+    # Now (re-)import the imagefs from disk, compare to original, rebuild only if changed.
+    # import_config reads the .ddb files from disk (including any just re-encoded above),
+    # so _entries_equal sees the actual post-encode content.
     ifs = ImageFs()
     ifs.import_config(section_dir / "imagefs_config.json")
 
@@ -325,26 +315,18 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
         orig_ifs.parse(original_imagefs_bytes)
         unchanged = _ifsmod._entries_equal(orig_ifs.entries, ifs.entries)
 
-    if unchanged and encoded == 0:
-        print(f"  section {section_idx:2d}  [imagefs]  unchanged — keeping original bytes")
-        return  # vbf already has the right bytes
-
-    if unchanged and encoded > 0:
-        # .ddb files on disk changed but imagefs_config.json wasn't regenerated;
-        # force a rebuild so the new .ddb content is picked up
-        unchanged = False
-
     if unchanged:
-        new_section_bytes = original_raw
-    else:
-        imagefs_bytes = ifs.save_to_vector()
-        if wrap_info is None:
-            new_section_bytes = imagefs_bytes
-        else:
-            new_section_bytes = _ifsmod._rewrap_gzip_tar(imagefs_bytes, wrap_info)
-        print(f"  section {section_idx:2d}  [imagefs]  repacked "
-              f"({len(new_section_bytes):,} bytes)")
+        # Content is byte-identical to original — keep original compressed bytes.
+        # This handles both "no PNGs touched" and "PNGs re-encoded losslessly".
+        print(f"  section {section_idx:2d}  [imagefs]  unchanged — keeping original bytes")
+        return
 
+    imagefs_bytes = ifs.save_to_vector()
+    if wrap_info is None:
+        new_section_bytes = imagefs_bytes
+    else:
+        new_section_bytes = _ifsmod._rewrap_gzip_tar(imagefs_bytes, wrap_info)
+    print(f"  section {section_idx:2d}  [imagefs]  repacked ({len(new_section_bytes):,} bytes)")
     vbf.replace_section_raw(section_idx, new_section_bytes)
 
 
