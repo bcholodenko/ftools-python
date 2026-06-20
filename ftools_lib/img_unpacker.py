@@ -166,12 +166,12 @@ def compress_and_replace_eif(img_sec: ImageSection, idx: int, res_bin: bytes, re
 # UnpackImg
 # --------------------------------------------------------------------- #
 
-def unpack_img(in_path, out_path) -> None:
+def unpack_img(in_path, out_path, ignore_crc=False) -> None:
     in_path = Path(in_path)
     out_path = Path(out_path)
 
     vbf = VbfFile()
-    vbf.open_file(in_path)
+    vbf.open_file(in_path, ignore_crc_mismatch=ignore_crc)
 
     img_sec_bin = vbf.get_section_raw(1)
 
@@ -289,13 +289,13 @@ def repack_resources(config_path, img_sec: ImageSection, csv_rows: list) -> None
             compress_and_replace_eif(img_sec, eif_idx[i], res_bin, get_name_from_idx(csv_rows, eif_idx[i]))
 
 
-def pack_img(config_path, vbf_path, out_path) -> None:
+def pack_img(config_path, vbf_path, out_path, ignore_crc=False) -> None:
     config_path = Path(config_path)
     vbf_path = Path(vbf_path)
     out_path = Path(out_path)
 
     vbf = VbfFile()
-    vbf.open_file(vbf_path)
+    vbf.open_file(vbf_path, ignore_crc_mismatch=ignore_crc)
 
     img_sec_bin = vbf.get_section_raw(1)
 
