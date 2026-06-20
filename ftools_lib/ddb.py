@@ -434,39 +434,49 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
                context: str = "<ddb data>") -> bytes:
     """Re-encode RGBA pixel data back into .ddb format.
 
-    Uses `original_data` (a real .ddb file) as a donor for the header and
-    any padding columns/rows beyond the visible width x height rectangle,
-    which are preserved verbatim. `width`/`height` must match the donor
-    exactly - resizing isn't supported. `rgba` must be width*height*4
-    bytes, top-down, R/G/B/A order.
+    Uses `original_data` (a real .ddb file) as a donor for the header
+    (type_byte/byte5/format) and, when `width`/`height` match the donor
+    exactly, for any padding columns/rows beyond the visible rectangle too
+    (preserved verbatim, giving a byte-identical file for unedited
+    pixels - including for the RLE formats, since the encoder reproduces
+    the original compressor's exact run/literal choices).
 
-    Unedited pixels round-trip to a byte-identical file, including for
-    the RLE formats (5, 7), since the encoder reproduces the original
-    compressor's exact run/literal choices.
+    `width`/`height` may differ from the donor's own dimensions - the
+    image is resized: a fresh buffer is built at the new size (padding
+    columns/rows are zero-filled rather than donor-preserved, since the
+    donor's padding doesn't correspond to anything at the new size) and
+    the header's width/height fields are updated to match. The output
+    will naturally be a different length than the donor in this case.
+
+    `rgba` must be width*height*4 bytes, top-down, R/G/B/A order.
     """
     hdr = _parse_header(original_data, context)
     fmt = hdr["format"]
     if fmt not in (2, 4, 5, 6, 7):
         raise DdbError(f"'{context}': donor .ddb uses an unsupported format byte {fmt}.")
-    if width != hdr["width"] or height != hdr["height"]:
-        raise DdbError(
-            f"'{context}': new image is {width}x{height} but donor is "
-            f"{hdr['width']}x{hdr['height']}. Resizing is not supported."
-        )
+    if width <= 0 or height <= 0:
+        raise DdbError(f"'{context}': width and height must be positive (got {width}x{height}).")
     if len(rgba) != width * height * 4:
         raise DdbError(f"'{context}': RGBA buffer size does not match width*height*4.")
 
+    resized = (width != hdr["width"] or height != hdr["height"])
     body = original_data[DDB_HEADER_SIZE:]
     s = _real_width(fmt, width)
     m = _mask_width(s)
 
-    if hdr["rle"]:
-        real_h = height
-        color_target = s * real_h * 2
+    if resized:
+        # Fresh buffers at the new size - no donor pixel data carries over,
+        # since the donor's padding/layout corresponds to different dimensions.
+        color_h = mask_h = height
+        donor_color = bytes(s * color_h * 2)
+        mask_plane = bytearray(m * mask_h) if hdr["mask"] else bytearray()
+    elif hdr["rle"]:
+        color_h = mask_h = height
+        color_target = s * height * 2
         donor_color, consumed = _rle_decode_words(body, color_target)
         mask_plane = bytearray()
         if hdr["mask"]:
-            mask_target = m * real_h
+            mask_target = m * height
             mask_plane[:] = _rle_decode_bytes(body[consumed:], mask_target)
     else:
         color_h, mask_h = _raw_real_height(fmt, width, height, s, len(original_data))
@@ -488,10 +498,11 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
             r, g, b, a = rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]
             val = _rgb_to_word(r, g, b)
             if hdr["mask"]:
-                # bit15 is unused for transparency here but still stored;
-                # preserve the donor's bit so unedited pixels round-trip exactly.
-                donor_word = struct.unpack_from("<H", donor_color, c_row_off + col * 2)[0]
-                val |= (donor_word & 0x8000)
+                if not resized:
+                    # bit15 is unused for transparency here but still stored;
+                    # preserve the donor's bit so unedited pixels round-trip exactly.
+                    donor_word = struct.unpack_from("<H", donor_color, c_row_off + col * 2)[0]
+                    val |= (donor_word & 0x8000)
                 mask_plane[m_row_off + col] = a
             else:
                 if a >= 0x80:
@@ -509,11 +520,13 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
         new_body = bytearray(color_plane)
         if hdr["mask"]:
             new_body += mask_plane
-        consumed_total = len(new_body)
-        if len(body) > consumed_total:
-            new_body += body[consumed_total:]
+        if not resized:
+            consumed_total = len(new_body)
+            if len(body) > consumed_total:
+                new_body += body[consumed_total:]
 
-    return original_data[:DDB_HEADER_SIZE] + bytes(new_body)
+    new_header = struct.pack(_HEADER_FMT, width, height, hdr["type_byte"], hdr["byte5"], fmt)
+    return new_header + bytes(new_body)
 
 
 # ── file-level helpers ────────────────────────────────────────────────────────
