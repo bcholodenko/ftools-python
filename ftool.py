@@ -390,11 +390,11 @@ def _pack_raw(entry: dict, workspace: Path, vbf: VbfFile) -> None:
 # Main commands: unpack / pack
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cmd_unpack(vbf_path: Path, workspace: Path, verbose: bool) -> int:
+def cmd_unpack(vbf_path: Path, workspace: Path, verbose: bool, ignore_crc: bool = False) -> int:
     print(f"Opening {vbf_path.name} …")
     vbf = VbfFile()
     try:
-        vbf.open_file(vbf_path)
+        vbf.open_file(vbf_path, ignore_crc_mismatch=ignore_crc)
     except VbfError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -465,7 +465,7 @@ def cmd_unpack(vbf_path: Path, workspace: Path, verbose: bool) -> int:
 
 
 def cmd_pack(workspace: Path, out_vbf: Path, vbf_override: Path | None,
-             verbose: bool) -> int:
+             verbose: bool, ignore_crc: bool = False) -> int:
     manifest_path = workspace / "manifest.json"
     if not manifest_path.exists():
         print(f"Error: no manifest.json in '{workspace}' — was this unpacked with ftool.py?",
@@ -493,7 +493,7 @@ def cmd_pack(workspace: Path, out_vbf: Path, vbf_override: Path | None,
     print(f"Opening {vbf_path.name} …")
     vbf = VbfFile()
     try:
-        vbf.open_file(vbf_path)
+        vbf.open_file(vbf_path, ignore_crc_mismatch=ignore_crc)
     except VbfError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -547,12 +547,18 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("unpack", help="Unpack a .vbf into an editable workspace")
     up.add_argument("vbf", type=Path, help="Input .vbf firmware file")
     up.add_argument("workspace", type=Path, help="Output workspace directory (must not exist)")
+    up.add_argument("--ignore-crc", action="store_true",
+                    help="Continue even if the VBF's stored CRC-32 doesn't match its actual "
+                         "content (e.g. a file that's already been hand-modified elsewhere) - "
+                         "prints a warning instead of stopping")
 
     pk = sub.add_parser("pack", help="Repack a workspace into a patched .vbf")
     pk.add_argument("workspace", type=Path, help="Workspace directory created by 'unpack'")
     pk.add_argument("output", type=Path, help="Output .vbf path")
     pk.add_argument("--vbf", dest="vbf_source", type=Path, default=None,
                     help="Original .vbf to patch (default: auto-detected from manifest)")
+    pk.add_argument("--ignore-crc", action="store_true",
+                    help="Same as unpack's --ignore-crc, applied when opening the donor .vbf")
 
     return p
 
@@ -562,10 +568,10 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "unpack":
-        return cmd_unpack(args.vbf, args.workspace, args.verbose)
+        return cmd_unpack(args.vbf, args.workspace, args.verbose, args.ignore_crc)
     elif args.command == "pack":
         return cmd_pack(args.workspace, args.output,
-                        getattr(args, "vbf_source", None), args.verbose)
+                        getattr(args, "vbf_source", None), args.verbose, args.ignore_crc)
     else:
         parser.print_help()
         return 0
