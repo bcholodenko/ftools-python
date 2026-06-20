@@ -69,7 +69,7 @@ What each section type produces:
 section_18_imagefs/
   files/                           ← full imagefs file tree (real paths)
     images/variant/.../foo.ddb     ← original .ddb, always kept
-    images/variant/.../foo.bmp     ← decoded BMP for editing (184/305 files)
+    images/variant/.../foo.png     ← decoded PNG for editing (transparency-aware)
     fonts/MHeiM18030_C.ttf         ← other embedded files
   imagefs_config.json              ← required by pack
   wrapping.json                    ← required by pack
@@ -102,10 +102,11 @@ section_NN_raw/
 
 ##### Editing
 
-- **imagefs `.ddb` bitmaps:** edit the `.bmp` in place. Pack re-encodes it
-  back to `.ddb` automatically if it's newer than the original `.ddb`.
-  Unsupported `.ddb` files (those without a `.bmp` sibling) pass through
-  unchanged.
+- **imagefs `.ddb` bitmaps:** edit the `.png` in place (including its alpha
+  channel — see the `ddbconverter.py` section below for how transparency
+  maps between the two formats). Pack re-encodes it back to `.ddb`
+  automatically if the `.png` is newer than the `.ddb`; an unedited `.ddb`
+  always passes through byte-for-byte unchanged.
 - **imagefs other files:** overwrite in place under `files/`.
 - **imgsection images/fonts:** drop replacements into `custom/` using the
   same filename as the original (same convention as `imgunpacker.py`).
@@ -127,6 +128,28 @@ python3 ftool.py pack ./workspace/ patched.vbf --vbf /path/to/original.vbf
 Pack is change-aware: it compares each section's current content to the
 original and only rebuilds sections where something actually changed.
 An unmodified workspace produces a byte-identical copy of the original.
+
+##### Working with a VBF that already has a bad checksum
+
+Every `.vbf` carries a CRC-32 of its own binary content in the ASCII
+header, and both `unpack` and `pack` verify it before doing anything else.
+If you have a file that's already been hand-modified by some other means
+(so the stored checksum is now stale) and you still want to work with it,
+pass `--ignore-crc`:
+
+```
+python3 ftool.py unpack already-modified.vbf ./workspace/ --ignore-crc
+python3 ftool.py pack ./workspace/ patched.vbf --ignore-crc
+```
+
+This downgrades the check to a printed warning instead of stopping.
+Nothing else changes - the actual section data is read/written exactly the
+same way. Since `pack` always recalculates the checksum field from
+scratch when saving, the output of the second command above will have a
+*correct* checksum even though the input didn't - if no other edits were
+made, every byte except that checksum field will be identical to the
+input. The same `--ignore-crc` flag is available on `vbfeditor.py`,
+`imagefsunpacker.py`, and `imgunpacker.py`.
 
 ---
 
@@ -299,45 +322,75 @@ are updated if that path is replaced.
 
 ## ddbconverter.py
 
-Converts a single `.ddb` bitmap to/from `.bmp`. `ftool.py` handles `.ddb`
+Converts a single `.ddb` bitmap to/from `.png`. `ftool.py` handles `.ddb`
 conversion automatically during unpack/pack; use this tool for individual
 files.
 
 ```
-python3 ddbconverter.py -U -i image.ddb -o image.bmp
-python3 ddbconverter.py -P -i edited.bmp -d image.ddb -o new.ddb
+python3 ddbconverter.py -U -i image.ddb -o image.png
+python3 ddbconverter.py -P -i edited.png -d image.ddb -o new.ddb
 ```
 
 Packing (`-P`) requires `-d/--donor`: the original `.ddb` file, which
 supplies the header bytes and any padding verbatim. The replacement image
-must be the exact same dimensions as the original.
+must be the exact same dimensions as the original. PNG was chosen over BMP
+specifically because `.ddb` pixels can carry transparency, and PNG's alpha
+channel maps onto it directly.
 
-##### Format support
+##### Format
 
-`.ddb` is an undocumented, proprietary format reverse-engineered empirically
-against a real resource pack (`JB5T-14C088-FB.vbf`, 305 files). Two of
-several observed variants are supported (~60% of files):
+`.ddb` is an undocumented, proprietary bitmap format used by the IPC's QNX
+image filesystem. It was reverse-engineered against a real resource pack
+(`JB5T-14C088-FB.vbf`, 305 files); all 5 observed variants are supported and
+every file in that pack round-trips byte-for-byte (decode to PNG, re-encode
+to `.ddb`, identical to the original).
 
-- **RAW16 (144/305 files, ~47%):** raw uncompressed 16-bit-per-pixel
-  RGB565, no palette. Row stride is `next_pow2(width)` pixels. Covers
-  every full-screen background, popup panel, and gradient image in the
-  reference pack.
+**Header** (8 bytes, little-endian):
 
-- **RAW24 (40/305 files, ~13%):** raw uncompressed 24-bit-per-pixel RGB,
-  no palette. Same stride scheme as RAW16. About a third of files in this
-  group have an extra 32-byte block before the pixel data (purpose unknown;
-  preserved verbatim on round-trip); the decoder auto-detects this from
-  the file length. **Known limitation:** a small subset of small interactive
-  icons in this group (checkbox/radio-button states, arrow buttons, on/off
-  toggle pairs) appear to need 16bpp rather than 24bpp, but no reliable
-  automatic discriminator was found -- those specific icons may show colour
-  banding. All 40 files pass byte-exact round-trip encode regardless.
+| Offset | Size | Field | Notes |
+|---|---|---|---|
+| 0 | 2 | width | visible width, pixels |
+| 2 | 2 | height | visible height, pixels |
+| 4 | 1 | type_byte | observed 0x02/0x03/0x82; doesn't affect decoding |
+| 5 | 1 | byte5 | always 0x80 in every sample |
+| 6 | 1 | format | see table below — determines everything else |
+| 7 | 1 | always 0 |
 
-- **Not supported (121/305 files, ~40%):** three header signatures used
-  mostly for telltales, gauge pointers, and small icons. These are
-  confirmed genuinely compressed (same dimensions produce different file
-  sizes). Unsupported files raise a clear error rather than silently
-  producing garbage, and pass through unchanged in `ftool.py`.
+**Pixel format** — a 16-bit word per pixel, *not* RGB565:
+
+| Bits | Field |
+|---|---|
+| 15 | alpha flag (1=opaque, 0=transparent) — only meaningful where there's no separate mask plane |
+| 14–10 | red (5 bits) |
+| 9–5 | green (5 bits) |
+| 4–0 | blue (5 bits) |
+
+Each 5-bit channel scales to 8-bit by multiplying by `255/31`.
+
+**The `format` byte** encodes two flags directly: `rle = format % 2 != 0`
+and `mask = format in (2, 6, 7)` (mask means a separate per-pixel alpha
+plane follows the color plane, instead of relying on bit 15):
+
+| format | rle | mask | role in reference pack |
+|---|---|---|---|
+| 4 | no | no | 144 files — opaque backgrounds/panels |
+| 6 | no | yes | 40 files — opaque-or-transparent icons |
+| 2 | no | yes | 3 files — infotainment tray panels |
+| 5 | yes | no | 52 files — compressed, fully opaque images |
+| 7 | yes | yes | 66 files — compressed icons/signs with transparency |
+
+Pixel data is stored in a row-major grid padded wider than the visible
+image (`realWidth` columns, only the leftmost `width` are visible) so the
+original renderer can address rows with a shift instead of a multiply.
+`realWidth` is the smallest value in `[16,32,64,128,256,512,1024]` that's
+`>= width`, except format 2 which uses `ceil(width/4)*4`. The mask plane
+(when present) pads its own row width to a multiple of 8.
+
+Compressed formats (5, 7) use a PackBits-style run-length scheme: a control
+word's top bit selects between a literal run (copy N raw pixels) and a
+repeat run (one pixel value repeated N times); the mask plane uses the same
+scheme one byte at a time instead of one 16-bit word at a time. Full bit-
+level detail is in the `ftools_lib/ddb.py` module docstring.
 
 ---
 
@@ -352,8 +405,8 @@ added during this port:
   image filesystem support, for firmware downloads that use this container
   instead of (or alongside) the FTools zip+EIF format.
 - **`ddbconverter.py`** / **`ftools_lib/ddb.py`** -- pixel-level `.ddb`
-  bitmap conversion, for the 60% of `.ddb` files whose format was
-  successfully reverse-engineered.
+  bitmap conversion, covering all known format variants with byte-exact
+  round-trip.
 
 ---
 
