@@ -1,11 +1,14 @@
 # ftools-python
 
-A from-scratch Python 3 rewrite of [FTools-5.0](https://github.com/AuRoN89/FTools),
-a toolset for unpacking and repacking the firmware of Ford IPC (instrument
-cluster) infotainment units, focused on the image/font/text resources stored
-inside `.vbf` firmware files. The original project is a set of C++17 console
-tools built with CMake; this port re-implements every tool as a pure Python 3
-script that runs on macOS (and Linux) without compiling anything.
+A Python 3 port of [FTools-5.0](https://github.com/AuRoN89/FTools), a
+toolset for unpacking and repacking the firmware of Ford IPC (instrument
+cluster) infotainment units, focused on the image/font/text resources
+stored inside `.vbf` firmware files. The original project is a set of
+C++17 console tools built with CMake; this port re-implements every tool
+as a pure Python 3 script that runs on macOS and Linux without compiling
+anything. A few additional tools with no equivalent in the original
+project are also included - see [New tools](#new-tools-not-in-ftools-50)
+below for which is which.
 
 ---
 
@@ -104,7 +107,8 @@ section_NN_raw/
 
 - **imagefs `.ddb` bitmaps:** edit the `.png` in place (including its alpha
   channel — see the `ddbconverter.py` section below for how transparency
-  maps between the two formats). Pack re-encodes it back to `.ddb`
+  maps between the two formats). The PNG can be resized to different
+  dimensions than the original. Pack re-encodes it back to `.ddb`
   automatically if the `.png` is newer than the `.ddb`; an unedited `.ddb`
   always passes through byte-for-byte unchanged.
 - **imagefs other files:** overwrite in place under `files/`.
@@ -129,13 +133,25 @@ Pack is change-aware: it compares each section's current content to the
 original and only rebuilds sections where something actually changed.
 An unmodified workspace produces a byte-identical copy of the original.
 
+Every `.vbf`'s ASCII header declares a `file_checksum` (a CRC-32 over the
+binary content), and every section separately carries its own CRC-16.
+`pack` always recalculates both correctly from scratch when saving, so a
+packed file's checksums are always valid regardless of what the input
+looked like.
+
+If an imagefs section's repacked size grows beyond its original size (for
+example after significantly enlarging an image), `pack` prints a warning:
+real hardware appears to allocate a fixed amount of space per section, and
+exceeding it can produce visual corruption even though the resulting file
+is well-formed. See `background_migration.py` below for a tool that edits
+within a fixed size budget instead of growing it.
+
 ##### Working with a VBF that already has a bad checksum
 
-Every `.vbf` carries a CRC-32 of its own binary content in the ASCII
-header, and both `unpack` and `pack` verify it before doing anything else.
-If you have a file that's already been hand-modified by some other means
-(so the stored checksum is now stale) and you still want to work with it,
-pass `--ignore-crc`:
+Both `unpack` and `pack` verify the file-level CRC-32 before doing
+anything else. If you have a file whose stored checksum is already stale
+for some other reason and you still want to work with it, pass
+`--ignore-crc`:
 
 ```
 python3 ftool.py unpack already-modified.vbf ./workspace/ --ignore-crc
@@ -144,11 +160,8 @@ python3 ftool.py pack ./workspace/ patched.vbf --ignore-crc
 
 This downgrades the check to a printed warning instead of stopping.
 Nothing else changes - the actual section data is read/written exactly the
-same way. Since `pack` always recalculates the checksum field from
-scratch when saving, the output of the second command above will have a
-*correct* checksum even though the input didn't - if no other edits were
-made, every byte except that checksum field will be identical to the
-input. The same `--ignore-crc` flag is available on `vbfeditor.py`,
+same way, and `pack`'s output will have a correct checksum either way. The
+same `--ignore-crc` flag is available on `vbfeditor.py`,
 `imagefsunpacker.py`, and `imgunpacker.py`.
 
 ---
@@ -306,11 +319,12 @@ Sections whose files weren't actually touched are left byte-for-byte
 identical to the input; only changed sections are rebuilt and re-compressed.
 
 ##### A note on the trailer checksum
-The image filesystem format ends with a 4-byte checksum whose exact
-algorithm could not be conclusively determined (see `ftools_lib/imagefs.py`
-for details). An unmodified section is always repacked from its original
-bytes, so this only matters if you actually change something. Treat an
-edited, repacked VBF as untested until verified on real hardware.
+The image filesystem format ends with a 4-byte trailer value of unknown
+purpose, written as a best-effort placeholder when a section is rebuilt
+from scratch (see `ftools_lib/imagefs.py`). An unmodified section is
+always repacked from its original bytes untouched, so this only matters
+if you actually change something inside a section. Treat an edited,
+repacked VBF as untested until verified on real hardware.
 
 ##### A note on duplicate paths
 Real firmware has been observed to contain more than one directory entry
@@ -332,18 +346,22 @@ python3 ddbconverter.py -P -i edited.png -d image.ddb -o new.ddb
 ```
 
 Packing (`-P`) requires `-d/--donor`: the original `.ddb` file, which
-supplies the header bytes and any padding verbatim. The replacement image
-must be the exact same dimensions as the original. PNG was chosen over BMP
-specifically because `.ddb` pixels can carry transparency, and PNG's alpha
-channel maps onto it directly.
+supplies the header byte (type_byte/byte5/format) verbatim. The
+replacement image can be a different size than the original - the file's
+width/height fields and internal layout are recomputed to match. Same-size
+edits additionally preserve any padding columns/rows from the donor
+byte-for-byte, so an unedited image round-trips to an identical file; a
+resized image is rebuilt fresh at the new dimensions instead, since the
+donor's padding doesn't correspond to anything at a different size. PNG
+was chosen over BMP specifically because `.ddb` pixels can carry
+transparency, and PNG's alpha channel maps onto it directly.
 
 ##### Format
 
-`.ddb` is an undocumented, proprietary bitmap format used by the IPC's QNX
-image filesystem. It was reverse-engineered against a real resource pack
-(`JB5T-14C088-FB.vbf`, 305 files); all 5 observed variants are supported and
-every file in that pack round-trips byte-for-byte (decode to PNG, re-encode
-to `.ddb`, identical to the original).
+`.ddb` is a proprietary bitmap format used by the IPC's QNX image
+filesystem. Five format variants are supported, covering every bitmap
+found in a typical resource pack, with byte-exact round-trip (decode to
+PNG, re-encode to `.ddb`, identical to the original) for every one of them.
 
 **Header** (8 bytes, little-endian):
 
@@ -356,7 +374,7 @@ to `.ddb`, identical to the original).
 | 6 | 1 | format | see table below — determines everything else |
 | 7 | 1 | always 0 |
 
-**Pixel format** — a 16-bit word per pixel, *not* RGB565:
+**Pixel format** — a 16-bit word per pixel, A1R5G5B5 (*not* RGB565):
 
 | Bits | Field |
 |---|---|
@@ -371,20 +389,20 @@ Each 5-bit channel scales to 8-bit by multiplying by `255/31`.
 and `mask = format in (2, 6, 7)` (mask means a separate per-pixel alpha
 plane follows the color plane, instead of relying on bit 15):
 
-| format | rle | mask | role in reference pack |
+| format | rle | mask | typical use |
 |---|---|---|---|
-| 4 | no | no | 144 files — opaque backgrounds/panels |
-| 6 | no | yes | 40 files — opaque-or-transparent icons |
-| 2 | no | yes | 3 files — infotainment tray panels |
-| 5 | yes | no | 52 files — compressed, fully opaque images |
-| 7 | yes | yes | 66 files — compressed icons/signs with transparency |
+| 4 | no | no | opaque backgrounds/panels |
+| 6 | no | yes | opaque-or-transparent icons |
+| 2 | no | yes | infotainment tray panels |
+| 5 | yes | no | compressed, fully opaque images |
+| 7 | yes | yes | compressed icons/signs with transparency |
 
 Pixel data is stored in a row-major grid padded wider than the visible
 image (`realWidth` columns, only the leftmost `width` are visible) so the
-original renderer can address rows with a shift instead of a multiply.
-`realWidth` is the smallest value in `[16,32,64,128,256,512,1024]` that's
-`>= width`, except format 2 which uses `ceil(width/4)*4`. The mask plane
-(when present) pads its own row width to a multiple of 8.
+renderer can address rows with a shift instead of a multiply. `realWidth`
+is the smallest value in `[16,32,64,128,256,512,1024]` that's `>= width`,
+except format 2 which uses `ceil(width/4)*4`. The mask plane (when
+present) pads its own row width to a multiple of 8.
 
 Compressed formats (5, 7) use a PackBits-style run-length scheme: a control
 word's top bit selects between a literal run (copy N raw pixels) and a
@@ -394,10 +412,62 @@ level detail is in the `ftools_lib/ddb.py` module docstring.
 
 ---
 
+## png_to_bmp_a1r5g5b5.py
+
+Standalone PNG → 16-bit BMP (A1R5G5B5) converter, independent of the
+`.ddb`/VBF pipeline above. Some IPC customization workflows expect a
+bitmap in exactly this pixel format as a direct upload, rather than a
+`.ddb` file.
+
+```
+python3 png_to_bmp_a1r5g5b5.py input.png output.bmp
+python3 png_to_bmp_a1r5g5b5.py input.png output.bmp --no-alpha
+```
+
+Produces a standard `BITMAPINFOHEADER` BMP, 16 bits/pixel, `BI_BITFIELDS`
+compression with explicit R/G/B masks (`0x7C00`/`0x03E0`/`0x001F`) - the
+same bit layout as the `.ddb` pixel format above (1-bit alpha + 5-5-5 RGB).
+Use `--no-alpha` to force every pixel fully opaque, for files meant as a
+base/background bitmap rather than something with its own transparency
+mask (a separate mask image, saved as 8-bit grayscale, is generally
+expected to carry transparency information instead - that file is
+produced with standard image editing tools, not this script).
+
+---
+
+## background_migration.py
+
+Relocates the 4 background image pieces (`left_active_cut`,
+`center_active_cut`, `right_active_cut`, `center_quiet_cut`) inside a
+graphics VBF's imagefs to full-screen dimensions, by de-duplicating the
+startup needle-sweep pointer animation frames and defragmenting the space
+that frees up.
+
+```
+python3 background_migration.py input-FB.vbf output-FB.vbf
+```
+
+The 4 relocated pieces come out as blank/transparent canvases at full
+size, ready for custom artwork. Options:
+
+- `--skip-join` -- keep the startup needle-sweep pointer animation intact
+  instead of de-duplicating its frames down to one static frame; there may
+  not be enough free space for the migration without that step, though.
+- `--section N` -- the imagefs section index, if it isn't the usual one
+  for your VBF (unpack with `ftool.py` first to check).
+
+Unlike a plain resize through `ftool.py` (which rebuilds the imagefs
+section at whatever size the new content needs), this tool only ever
+relocates existing data within space that's already accounted for within
+the section, so the section's overall size never changes - see the size
+note in the `ftool.py` section above for why that matters.
+
+---
+
 ## New tools (not in FTools-5.0)
 
-The following tools have no equivalent in the original C++ project and were
-added during this port:
+The following have no equivalent in the original C++ project and were
+added in this port:
 
 - **`ftool.py`** -- master unpack/pack orchestrator; auto-detects and
   handles all section types in one command.
@@ -407,6 +477,14 @@ added during this port:
 - **`ddbconverter.py`** / **`ftools_lib/ddb.py`** -- pixel-level `.ddb`
   bitmap conversion, covering all known format variants with byte-exact
   round-trip.
+- **`png_to_bmp_a1r5g5b5.py`** -- standalone PNG to 16-bit BMP (A1R5G5B5)
+  converter.
+- **`background_migration.py`** -- full-screen background relocation
+  within a graphics VBF's imagefs.
+
+Everything else (`imgunpacker.py`, `eifconverter.py`, `vbfeditor.py`,
+`imgsectionparser.py`, `textsectionparser.py`, `ziprepacker.py`) is a
+direct port of the corresponding original FTools-5.0 tool.
 
 ---
 
