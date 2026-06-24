@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Standalone PNG -> 16-bit BMP (A1 R5 G5 B5) converter.
+
+Produces a 16-bit BMP using 1-bit alpha + 5-5-5 RGB, no donor .ddb and no VBF
+packing involved - just a PNG in, a ready-to-upload .bmp out.
+
+Pixel encoding (bit 15 down to bit 0): A RRRRR GGGGG BBBBB
+  - alpha: bit 15 set  = opaque (>=0x80 in the source PNG's alpha channel)
+            bit 15 clear = transparent
+  - R/G/B: each channel scaled from 8-bit (0-255) down to 5-bit (0-31)
+
+Usage:
+    python3 png_to_bmp_a1r5g5b5.py input.png output.bmp
+    python3 png_to_bmp_a1r5g5b5.py input.png output.bmp --no-alpha   # force fully opaque
+"""
+import argparse
+import struct
+import sys
+from pathlib import Path
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.exit("This tool requires Pillow: pip install Pillow")
+
+_CHANNEL_SCALE = 255 / 31
+
+
+def _rgb_to_word(r: int, g: int, b: int, a: int) -> int:
+    r5 = round(r / _CHANNEL_SCALE) & 0x1F
+    g5 = round(g / _CHANNEL_SCALE) & 0x1F
+    b5 = round(b / _CHANNEL_SCALE) & 0x1F
+    word = (r5 << 10) | (g5 << 5) | b5
+    if a >= 0x80:
+        word |= 0x8000
+    return word
+
+
+def png_to_a1r5g5b5_pixels(img: "Image.Image", force_opaque: bool = False) -> bytes:
+    """Returns raw top-down 16-bit-per-pixel A1R5G5B5 pixel data."""
+    img = img.convert("RGBA")
+    w, h = img.size
+    src = img.tobytes()
+    out = bytearray(w * h * 2)
+    for i in range(w * h):
+        o = i * 4
+        r, g, b, a = src[o], src[o + 1], src[o + 2], src[o + 3]
+        if force_opaque:
+            a = 255
+        word = _rgb_to_word(r, g, b, a)
+        struct.pack_into("<H", out, i * 2, word)
+    return bytes(out)
+
+
+def write_bmp_16bit_a1r5g5b5(pixels_top_down: bytes, width: int, height: int, out_path) -> None:
+    """Writes a standard BITMAPINFOHEADER BMP, 16 bits/pixel, BI_BITFIELDS
+    compression with explicit R/G/B masks (0x7C00/0x03E0/0x001F) - the
+    common "16-bit X1R5G5B5 / A1R5G5B5" BMP variant Photoshop/GIMP export
+    and PimpMyFord expects. Rows are stored bottom-up per the BMP spec
+    (each row padded to a multiple of 4 bytes, though 16bpp * even widths
+    are already 4-byte aligned for any width - BMP row stride must still
+    be rounded up to be safe for odd widths).
+    """
+    row_bytes_unpadded = width * 2
+    row_stride = (row_bytes_unpadded + 3) & ~3
+    pad = row_stride - row_bytes_unpadded
+
+    # flip top-down -> bottom-up, and pad each row
+    rows = []
+    for y in range(height - 1, -1, -1):
+        row = pixels_top_down[y * row_bytes_unpadded:(y + 1) * row_bytes_unpadded]
+        rows.append(row + b"\x00" * pad)
+    pixel_data = b"".join(rows)
+
+    DIB_HEADER_SIZE = 40
+    MASKS_SIZE = 12  # 3 DWORDs: R, G, B (BI_BITFIELDS)
+    pixel_data_offset = 14 + DIB_HEADER_SIZE + MASKS_SIZE
+    file_size = pixel_data_offset + len(pixel_data)
+
+    file_header = b"BM" + struct.pack("<IHHI", file_size, 0, 0, pixel_data_offset)
+
+    dib_header = struct.pack(
+        "<IiiHHIIiiII",
+        DIB_HEADER_SIZE,  # biSize
+        width,            # biWidth
+        height,           # biHeight (positive = bottom-up)
+        1,                # biPlanes
+        16,               # biBitCount
+        3,                # biCompression = BI_BITFIELDS
+        len(pixel_data),  # biSizeImage
+        0, 0,             # biXPelsPerMeter, biYPelsPerMeter
+        0,                # biClrUsed
+        0,                # biClrImportant
+    )
+    masks = struct.pack("<III", 0x7C00, 0x03E0, 0x001F)  # R, G, B
+
+    Path(out_path).write_bytes(file_header + dib_header + masks + pixel_data)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input_png", type=Path)
+    p.add_argument("output_bmp", type=Path)
+    p.add_argument("--no-alpha", action="store_true",
+                   help="Force every pixel fully opaque, ignoring the PNG's alpha channel "
+                        "(use for base/background bitmaps; omit this for _mask files - "
+                        "those should be saved as 8-bit grayscale separately, not via this tool)")
+    args = p.parse_args()
+
+    img = Image.open(args.input_png)
+    w, h = img.size
+    pixels = png_to_a1r5g5b5_pixels(img, force_opaque=args.no_alpha)
+    write_bmp_16bit_a1r5g5b5(pixels, w, h, args.output_bmp)
+    print(f"Wrote {args.output_bmp} ({w}x{h}, 16-bit A1R5G5B5, "
+          f"{'opaque' if args.no_alpha else 'with alpha'})")
+
+
+if __name__ == "__main__":
+    main()
