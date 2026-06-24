@@ -274,11 +274,12 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
     wrap_info = wrapping["wrap"]
 
     # Re-encode any .png files that are newer than their .ddb counterpart
-    encoded = 0
+    kept_original = []  # (filename, reason) for anything that did NOT take the edit
     for png_path in sorted(files_dir.rglob("*.png")):
         ddb_path = png_path.with_suffix(".ddb")
         if not ddb_path.exists():
             print(f"    WARNING: {png_path.name} has no matching .ddb — skipping")
+            kept_original.append((png_path.name, "no matching .ddb"))
             continue
         if png_path.stat().st_mtime <= ddb_path.stat().st_mtime:
             continue  # .png not newer — .ddb is authoritative, no re-encode needed
@@ -286,13 +287,20 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
         if not ddbmod.is_supported_ddb(ddb_data):
             print(f"    WARNING: {ddb_path.name} is unsupported format — "
                   f"cannot re-encode from .png, using original .ddb")
+            kept_original.append((ddb_path.name, "unsupported format"))
             continue
         try:
             ddbmod.png_file_to_ddb_file(png_path, ddb_path, ddb_path)
-            encoded += 1
             print(f"    re-encoded {ddb_path.name} from .png")
         except ddbmod.DdbError as e:
             print(f"    WARNING: could not re-encode {ddb_path.name}: {e}")
+            kept_original.append((ddb_path.name, str(e)))
+
+    if kept_original:
+        print(f"    *** {len(kept_original)} edited .png(s) did NOT make it into this VBF - "
+              f"easy to miss among the lines above, so check these: ***")
+        for name, reason in kept_original:
+            print(f"        - {name}: {reason}")
 
     # Now (re-)import the imagefs from disk, compare to original, rebuild only if changed.
     # import_config reads the .ddb files from disk (including any just re-encoded above),
@@ -322,6 +330,20 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
         return
 
     imagefs_bytes = ifs.save_to_vector()
+
+    if original_imagefs_bytes is not None and len(imagefs_bytes) > len(original_imagefs_bytes):
+        growth = len(imagefs_bytes) - len(original_imagefs_bytes)
+        print(
+            f"    *** WARNING: this section grew by {growth:,} bytes "
+            f"({len(original_imagefs_bytes):,} -> {len(imagefs_bytes):,}). Editing/resizing images "
+            f"normally rebuilds this section at whatever size the new content needs, with no "
+            f"guarantee the result still fits within whatever space the real hardware actually "
+            f"budgets for it - real devices have shown visual corruption after flashing an "
+            f"oversized rebuild like this, even though the file itself is well-formed. If you're "
+            f"enlarging images significantly, consider relocating them into existing free space "
+            f"instead (see background_migration.py) so the overall section size never changes. ***"
+        )
+
     if wrap_info is None:
         new_section_bytes = imagefs_bytes
     else:
