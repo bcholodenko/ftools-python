@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
-"""Standalone PNG -> 16-bit BMP (A1 R5 G5 B5) converter.
+"""Standalone PNG -> 16-bit BMP (A1 R5 G5 B5) converter with dithering.
 
-Produces a 16-bit BMP using 1-bit alpha + 5-5-5 RGB, no donor .ddb and no VBF
+Produces exactly the file format the community IPC customization guides
+ask for when uploading custom background templates or base+mask bitmaps:
+a 16-bit BMP using 1-bit alpha + 5-5-5 RGB, no donor .ddb and no VBF
 packing involved - just a PNG in, a ready-to-upload .bmp out.
 
 Pixel encoding (bit 15 down to bit 0): A RRRRR GGGGG BBBBB
   - alpha: bit 15 set  = opaque (>=0x80 in the source PNG's alpha channel)
-            bit 15 clear = transparent
+           bit 15 clear = transparent
   - R/G/B: each channel scaled from 8-bit (0-255) down to 5-bit (0-31)
+
+Features Floyd-Steinberg dithering to prevent color banding on smooth
+gradients (5-bit-per-channel color only has 32 levels per channel, so a
+smooth gradient quantized without dithering shows visible steps).
 
 Usage:
     python3 png_to_bmp_a1r5g5b5.py input.png output.bmp
-    python3 png_to_bmp_a1r5g5b5.py input.png output.bmp --no-alpha   # force fully opaque
+    python3 png_to_bmp_a1r5g5b5.py input.png output.bmp --no-alpha
+    python3 png_to_bmp_a1r5g5b5.py input.png output.bmp --no-dither
 """
 import argparse
 import struct
@@ -23,32 +30,44 @@ try:
 except ImportError:
     sys.exit("This tool requires Pillow: pip install Pillow")
 
-_CHANNEL_SCALE = 255 / 31
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ftools_lib.ddb import dither_rgb_to_5bit
 
 
-def _rgb_to_word(r: int, g: int, b: int, a: int) -> int:
-    r5 = round(r / _CHANNEL_SCALE) & 0x1F
-    g5 = round(g / _CHANNEL_SCALE) & 0x1F
-    b5 = round(b / _CHANNEL_SCALE) & 0x1F
-    word = (r5 << 10) | (g5 << 5) | b5
-    if a >= 0x80:
-        word |= 0x8000
-    return word
+def png_to_a1r5g5b5_pixels(img: "Image.Image", force_opaque: bool = False, dither: bool = True) -> bytes:
+    """Returns raw top-down 16-bit-per-pixel A1R5G5B5 pixel data.
 
-
-def png_to_a1r5g5b5_pixels(img: "Image.Image", force_opaque: bool = False) -> bytes:
-    """Returns raw top-down 16-bit-per-pixel A1R5G5B5 pixel data."""
+    Uses the exact same Floyd-Steinberg dithering as ftools_lib.ddb's
+    encode_ddb() (imported from there, not reimplemented here), so a
+    .ddb and a BMP produced from the same source image are quantized
+    identically.
+    """
     img = img.convert("RGBA")
     w, h = img.size
-    src = img.tobytes()
+    rgba = img.tobytes()
+
     out = bytearray(w * h * 2)
-    for i in range(w * h):
-        o = i * 4
-        r, g, b, a = src[o], src[o + 1], src[o + 2], src[o + 3]
-        if force_opaque:
-            a = 255
-        word = _rgb_to_word(r, g, b, a)
-        struct.pack_into("<H", out, i * 2, word)
+    if dither:
+        planes = dither_rgb_to_5bit(rgba, w, h)
+        for i in range(w * h):
+            r5, g5, b5 = planes[i]
+            a = 255 if force_opaque else rgba[i * 4 + 3]
+            word = (r5 << 10) | (g5 << 5) | b5
+            if a >= 0x80:
+                word |= 0x8000
+            struct.pack_into("<H", out, i * 2, word)
+    else:
+        for i in range(w * h):
+            o = i * 4
+            r, g, b = rgba[o], rgba[o + 1], rgba[o + 2]
+            a = 255 if force_opaque else rgba[o + 3]
+            r5 = max(0, min(31, int(r * 31 / 255 + 0.5)))
+            g5 = max(0, min(31, int(g * 31 / 255 + 0.5)))
+            b5 = max(0, min(31, int(b * 31 / 255 + 0.5)))
+            word = (r5 << 10) | (g5 << 5) | b5
+            if a >= 0x80:
+                word |= 0x8000
+            struct.pack_into("<H", out, i * 2, word)
     return bytes(out)
 
 
@@ -56,10 +75,8 @@ def write_bmp_16bit_a1r5g5b5(pixels_top_down: bytes, width: int, height: int, ou
     """Writes a standard BITMAPINFOHEADER BMP, 16 bits/pixel, BI_BITFIELDS
     compression with explicit R/G/B masks (0x7C00/0x03E0/0x001F) - the
     common "16-bit X1R5G5B5 / A1R5G5B5" BMP variant Photoshop/GIMP export
-    and PimpMyFord expects. Rows are stored bottom-up per the BMP spec
-    (each row padded to a multiple of 4 bytes, though 16bpp * even widths
-    are already 4-byte aligned for any width - BMP row stride must still
-    be rounded up to be safe for odd widths).
+    and the community tooling expects. Rows are stored bottom-up per the
+    BMP spec (each row padded to a multiple of 4 bytes).
     """
     row_bytes_unpadded = width * 2
     row_stride = (row_bytes_unpadded + 3) & ~3
@@ -105,14 +122,17 @@ def main():
                    help="Force every pixel fully opaque, ignoring the PNG's alpha channel "
                         "(use for base/background bitmaps; omit this for _mask files - "
                         "those should be saved as 8-bit grayscale separately, not via this tool)")
+    p.add_argument("--no-dither", action="store_true",
+                   help="Disable Floyd-Steinberg dithering (results in visible color banding on gradients).")
     args = p.parse_args()
 
     img = Image.open(args.input_png)
     w, h = img.size
-    pixels = png_to_a1r5g5b5_pixels(img, force_opaque=args.no_alpha)
+    pixels = png_to_a1r5g5b5_pixels(img, force_opaque=args.no_alpha, dither=not args.no_dither)
     write_bmp_16bit_a1r5g5b5(pixels, w, h, args.output_bmp)
     print(f"Wrote {args.output_bmp} ({w}x{h}, 16-bit A1R5G5B5, "
-          f"{'opaque' if args.no_alpha else 'with alpha'})")
+          f"{'opaque' if args.no_alpha else 'with alpha'}, "
+          f"{'nearest-neighbor' if args.no_dither else 'dithered'})")
 
 
 if __name__ == "__main__":
