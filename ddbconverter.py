@@ -36,6 +36,22 @@ def build_parser():
         "-d", "--donor",
         help="(required for -P) the original .ddb file this PNG came from",
     )
+    p.add_argument(
+        "--no-dither", action="store_true",
+        help="Disable Floyd-Steinberg dithering when packing (-P); results in visible "
+             "color banding on gradients but matches the literal nearest 5-bit level.",
+    )
+    p.add_argument(
+        "--efs", action="store_true",
+        help="This .ddb came from an EXE-VBF's efs.bin container (extracted via "
+             "ftools_lib.efs.EfsFs), not a graphics-VBF's bitmaps.bin imagefs - uses "
+             "the different realWidth rounding rule efs.bin files need. Without this "
+             "flag, efs.bin-sourced files will very likely round-trip with corrupted "
+             "pixel data, since the row stride assumption is wrong for them. Make sure "
+             "-i/-d keeps the file's real original name (or close to it) when using "
+             "this flag - it doubles as the lookup key for two known named exceptions "
+             "to the realWidth rule (see ftools_lib/ddb.py's _EFS_REALWIDTH_OVERRIDES).",
+    )
     return p
 
 
@@ -48,12 +64,14 @@ def main():
         print("Please specify an input file with -i/--input.")
         return 0
     input_path = Path(input_path)
+    width_convention = "efs" if args.efs else "bitmaps"
 
     try:
         if args.unpack:
             out_path = Path(args.output) if args.output else input_path.with_suffix(".png")
             data = read_file(input_path)
-            ddbmod.ddb_to_png_file(data, out_path, context=str(input_path))
+            ddbmod.ddb_to_png_file(data, out_path, context=str(input_path),
+                                   width_convention=width_convention)
             print(f"Wrote {out_path}")
 
         elif args.pack:
@@ -61,7 +79,9 @@ def main():
                 print("Packing requires -d/--donor (the original .ddb this PNG came from).")
                 return 0
             out_path = Path(args.output) if args.output else Path(args.donor)
-            ddbmod.png_file_to_ddb_file(input_path, Path(args.donor), out_path)
+            ddbmod.png_file_to_ddb_file(input_path, Path(args.donor), out_path,
+                                        dither=not args.no_dither,
+                                        width_convention=width_convention)
             print(f"Wrote {out_path}")
 
         else:
