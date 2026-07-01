@@ -24,8 +24,9 @@ Pipeline:
 """
 import struct
 import sys
+from pathlib import Path
 
-sys.path.insert(0, '/home/claude/build/ftools-python')
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ftools_lib.imagefs as ifmod
 
 # Exact full-screen target dimensions for the 4 relocated background pieces.
@@ -185,9 +186,6 @@ def migrate_to_full_screen(blob):
 def run_full_migration(vbf_path, out_path, section_idx=18, skip_join=False):
     """End-to-end: unwrap the imagefs section, run the full pipeline, rewrap,
     and write a new VBF. Returns a short summary string."""
-    import gzip
-    import sys as _sys
-    _sys.path.insert(0, '/home/claude/build/ftools-python')
     from ftools_lib.vbf import VbfFile
     import imagefsunpacker as ifu
 
@@ -252,6 +250,5 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys as _sys
-    _sys.exit(main())
+    sys.exit(main())
 
