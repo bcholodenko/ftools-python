@@ -165,9 +165,9 @@ def find_imagefs_sections(vbf: VbfFile) -> dict:
     return found
 
 
-def unpack_vbf(vbf_path, out_dir) -> int:
+def unpack_vbf(vbf_path, out_dir, ignore_crc=False) -> int:
     vbf = VbfFile()
-    vbf.open_file(vbf_path)
+    vbf.open_file(vbf_path, ignore_crc_mismatch=ignore_crc)
 
     found = find_imagefs_sections(vbf)
     if not found:
@@ -190,9 +190,9 @@ def unpack_vbf(vbf_path, out_dir) -> int:
     return 0
 
 
-def pack_vbf(vbf_path, exported_dir, out_path) -> int:
+def pack_vbf(vbf_path, exported_dir, out_path, ignore_crc=False) -> int:
     vbf = VbfFile()
-    vbf.open_file(vbf_path)
+    vbf.open_file(vbf_path, ignore_crc_mismatch=ignore_crc)
 
     exported_dir = Path(exported_dir)
     section_dirs = sorted(exported_dir.glob("section_*"))
@@ -257,6 +257,9 @@ def build_parser():
     p.add_argument("-o", "--output", help="Output directory (-u) or output VBF path (-p)")
     p.add_argument("-v", "--vbf", help="VBF file to read from / patch")
     p.add_argument("vbf_pos", nargs="?", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--ignore-crc", action="store_true",
+                   help="Continue even if the VBF's stored CRC-32 doesn't match its actual "
+                        "content - prints a warning instead of stopping")
     return p
 
 
@@ -279,7 +282,7 @@ def main():
     try:
         if args.unpack:
             out_dir = Path(args.output) if args.output else Path.cwd() / "imagefs_exported"
-            return unpack_vbf(vbf_path, out_dir)
+            return unpack_vbf(vbf_path, out_dir, args.ignore_crc)
         else:
             if not args.exported:
                 print("Please specify the exported directory to repack from with -e/--exported.")
@@ -287,7 +290,7 @@ def main():
             if not args.output:
                 print("Please specify an output VBF path with -o/--output.")
                 return 0
-            return pack_vbf(vbf_path, args.exported, args.output)
+            return pack_vbf(vbf_path, args.exported, args.output, args.ignore_crc)
     except (VbfError, ImageFsError) as e:
         print(f"Error: {e}")
         return -1
