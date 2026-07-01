@@ -157,11 +157,11 @@ class DirEntry:
 
     __slots__ = (
         "kind", "path", "ino", "mode", "gid", "uid", "mtime",
-        "extattr_offset", "data", "target", "dev", "rdev",
+        "extattr_offset", "data", "target", "dev", "rdev", "alias_key",
     )
 
     def __init__(self, kind, path, ino=0, mode=0, gid=0, uid=0, mtime=0,
-                 extattr_offset=0, data=b"", target="", dev=0, rdev=0):
+                 extattr_offset=0, data=b"", target="", dev=0, rdev=0, alias_key=None):
         self.kind = kind  # "dir" | "file" | "symlink" | "device"
         self.path = path
         self.ino = ino
@@ -174,6 +174,15 @@ class DirEntry:
         self.target = target    # only meaningful for kind == "symlink"
         self.dev = dev          # only meaningful for kind == "device"
         self.rdev = rdev        # only meaningful for kind == "device"
+        # Set by parse() when this file shares its original (offset, size)
+        # with one or more other entries - i.e. they were already aliased to
+        # the same underlying storage in the source. None for entries that
+        # had their own independent storage, or that didn't come from
+        # parse() at all (e.g. created via import_config()). save_to_vector()
+        # uses this to preserve *existing* aliasing through a rebuild,
+        # without introducing new aliasing just because two independent
+        # entries happen to currently hold identical bytes.
+        self.alias_key = alias_key
 
 
 class ImageFs:
@@ -272,7 +281,8 @@ class ImageFs:
                         f"(offset={offset}, size={fsize}, data is {len(bin_data)} bytes)."
                     )
                 data = bin_data[offset:offset + fsize]
-                entry = DirEntry("file", path, ino, mode, gid, uid, mtime, extattr_offset, data=data)
+                entry = DirEntry("file", path, ino, mode, gid, uid, mtime, extattr_offset,
+                                 data=data, alias_key=(offset, fsize))
 
             elif typ == S_IFDIR:
                 path = _cstr(rest)
@@ -400,6 +410,13 @@ class ImageFs:
                 data_file.parent.mkdir(parents=True, exist_ok=True)
                 write_file(data_file, e.data)
                 item["data_file"] = str(Path("files") / disk_rel)
+                if e.alias_key is not None:
+                    # [offset, size] this entry shared with others in the
+                    # original image - see DirEntry.alias_key. Lets pack
+                    # preserve that sharing through a rebuild even though
+                    # this round-trips through files on disk, where the
+                    # original offset isn't otherwise recoverable.
+                    item["alias_key"] = list(e.alias_key)
             elif e.kind == "symlink":
                 item["target"] = e.target
             elif e.kind == "device":
@@ -448,7 +465,9 @@ class ImageFs:
                         data = read_file(data_path)
                     except Exception as e:
                         raise ImageFsError(f"Could not read file data '{data_path}': {e}")
-                    entries.append(DirEntry("file", *common, data=data))
+                    alias_key = item.get("alias_key")
+                    entries.append(DirEntry("file", *common, data=data,
+                                            alias_key=tuple(alias_key) if alias_key is not None else None))
                 elif kind == "dir":
                     entries.append(DirEntry("dir", *common))
                 elif kind == "symlink":
@@ -522,15 +541,41 @@ class ImageFs:
         # Pass 2: now that file data placement can start at hdr_dir_size,
         # lay files out back-to-back (no inter-file padding, matching the
         # original format) in directory-traversal order, and re-encode
-        # every entry with its real file offset filled in.
+        # every entry with its real file offset filled in. Entries that
+        # were already aliased to shared storage at parse time (same
+        # alias_key) get written once and share that placement again here -
+        # this matters because some entries are deliberately made to alias
+        # each other (e.g. to free up space elsewhere) and a naive rebuild
+        # would silently undo that by writing each one out independently.
+        # If any member of such a group has since been edited so the group
+        # is no longer byte-identical throughout, the whole group falls
+        # back to independent placement rather than guessing which subset
+        # still matches.
+        alias_groups = {}
+        for entry in self.entries:
+            if entry.kind == "file" and entry.alias_key is not None:
+                alias_groups.setdefault(entry.alias_key, []).append(entry)
+        still_aliasable = {
+            key for key, members in alias_groups.items()
+            if len(members) > 1 and len({e.data for e in members}) == 1
+        }
+
         cursor = hdr_dir_size
         final_records = []
         file_blobs = []
+        placed_offset_by_alias_key = {}
         for entry in self.entries:
             if entry.kind == "file":
-                final_records.append(self._encode_entry(entry, cursor))
-                file_blobs.append(entry.data)
-                cursor += len(entry.data)
+                key = entry.alias_key if entry.alias_key in still_aliasable else None
+                existing_offset = placed_offset_by_alias_key.get(key) if key is not None else None
+                if existing_offset is not None:
+                    final_records.append(self._encode_entry(entry, existing_offset))
+                else:
+                    final_records.append(self._encode_entry(entry, cursor))
+                    file_blobs.append(entry.data)
+                    if key is not None:
+                        placed_offset_by_alias_key[key] = cursor
+                    cursor += len(entry.data)
             else:
                 final_records.append(self._encode_entry(entry))
 
