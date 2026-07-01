@@ -33,6 +33,9 @@ def build_parser():
     p.add_argument("-o", "--output", help="Output path")
     p.add_argument("-v", "--vbf", help="VBF file which will be patched")
     p.add_argument("vbf_pos", nargs="?", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--ignore-crc", action="store_true",
+                   help="Continue even if the VBF's stored CRC-32 doesn't match its actual "
+                        "content - prints a warning instead of stopping")
     return p
 
 
@@ -68,9 +71,9 @@ def main():
 
     try:
         if args.pack:
-            pack_img(args.conf, vbf_path, out_path)
+            pack_img(args.conf, vbf_path, out_path, args.ignore_crc)
         else:
-            unpack_img(vbf_path, out_path)
+            unpack_img(vbf_path, out_path, args.ignore_crc)
     except RuntimeError as e:
         print(f"Error: {e}")
         return -1
