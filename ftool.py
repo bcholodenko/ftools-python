@@ -57,7 +57,6 @@ Editing workflow:
 import argparse
 import json
 import os
-import shutil
 import struct
 import sys
 from pathlib import Path
@@ -67,7 +66,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
 from ftools_lib.vbf import VbfFile, VbfError
-from ftools_lib.imagefs import ImageFs, ImageFsError
+from ftools_lib.imagefs import ImageFs
 from ftools_lib.image_section import ImageSection
 from ftools_lib.text_section import STRUCT_SIZE as _TEXT_SECTION_STRUCT_SIZE
 from ftools_lib import text_section as ts
@@ -260,7 +259,7 @@ def _unpack_raw(section_idx: int, raw: bytes, section_dir: Path) -> dict:
 # Per-type pack helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
+def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile, dither: bool = True) -> None:
     """Repack an imagefs section, converting any edited .png files back to
     .ddb first. Files without a corresponding .png, or with an unsupported
     .ddb, pass through unchanged."""
@@ -272,6 +271,19 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
     with open(section_dir / "wrapping.json") as f:
         wrapping = json.load(f)
     wrap_info = wrapping["wrap"]
+
+    # Filename patterns the reference community tooling for this firmware
+    # family explicitly refuses to let you resize/replace via its own
+    # single-file editor (it requires its own special-cased workflow for
+    # these instead) - usually because the file is one of a positioned/paired
+    # set, or is itself a regular background/template piece. Resizing one
+    # of these through the generic PNG-edit path below still works
+    # mechanically, but is more likely to need the position/pairing
+    # accounted for by hand than an ordinary icon would.
+    _RESIZE_CAUTION_PATTERNS = (
+        "cut", "pointer", "tab_", "message_center.ddb", "tray",
+        "_on.ddb", "_off.ddb", "popups", "scale.ddb",
+    )
 
     # Re-encode any .png files that are newer than their .ddb counterpart
     kept_original = []  # (filename, reason) for anything that did NOT take the edit
@@ -289,8 +301,17 @@ def _pack_imagefs(entry: dict, workspace: Path, vbf: VbfFile) -> None:
                   f"cannot re-encode from .png, using original .ddb")
             kept_original.append((ddb_path.name, "unsupported format"))
             continue
+        if any(p in ddb_path.name for p in _RESIZE_CAUTION_PATTERNS):
+            from PIL import Image
+            old_decoded = ddbmod.decode_ddb(ddb_data)
+            old_w, old_h = old_decoded["width"], old_decoded["height"]
+            new_w, new_h = Image.open(png_path).size
+            if (new_w, new_h) != (old_w, old_h):
+                print(f"    NOTE: {ddb_path.name} matches a filename pattern that's often part of "
+                      f"a positioned or paired set ({old_w}x{old_h} -> {new_w}x{new_h}) - double-check "
+                      f"anything else that's meant to line up with it.")
         try:
-            ddbmod.png_file_to_ddb_file(png_path, ddb_path, ddb_path)
+            ddbmod.png_file_to_ddb_file(png_path, ddb_path, ddb_path, dither=dither)
             print(f"    re-encoded {ddb_path.name} from .png")
         except ddbmod.DdbError as e:
             print(f"    WARNING: could not re-encode {ddb_path.name}: {e}")
@@ -481,13 +502,13 @@ def cmd_unpack(vbf_path: Path, workspace: Path, verbose: bool, ignore_crc: bool 
         json.dump(manifest, f, indent=2)
 
     print(f"\nWorkspace written to: {workspace}")
-    print(f"Edit files under the section directories, then run:")
+    print("Edit files under the section directories, then run:")
     print(f"  ftool.py pack {workspace} <output.vbf>")
     return 0
 
 
 def cmd_pack(workspace: Path, out_vbf: Path, vbf_override: Path | None,
-             verbose: bool, ignore_crc: bool = False) -> int:
+             verbose: bool, ignore_crc: bool = False, dither: bool = True) -> int:
     manifest_path = workspace / "manifest.json"
     if not manifest_path.exists():
         print(f"Error: no manifest.json in '{workspace}' — was this unpacked with ftool.py?",
@@ -527,7 +548,7 @@ def cmd_pack(workspace: Path, out_vbf: Path, vbf_override: Path | None,
             continue  # tiny sentinels keep their original bytes
         try:
             if kind == "imagefs":
-                _pack_imagefs(entry, workspace, vbf)
+                _pack_imagefs(entry, workspace, vbf, dither=dither)
             elif kind == "imgsection":
                 _pack_imgsection(entry, workspace, vbf)
             elif kind == "textsection":
@@ -581,6 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Original .vbf to patch (default: auto-detected from manifest)")
     pk.add_argument("--ignore-crc", action="store_true",
                     help="Same as unpack's --ignore-crc, applied when opening the donor .vbf")
+    pk.add_argument("--no-dither", action="store_true",
+                    help="Disable Floyd-Steinberg dithering when re-encoding edited .ddb images; "
+                         "results in visible color banding on gradients. Has no effect on "
+                         "images that weren't edited.")
 
     return p
 
@@ -593,7 +618,8 @@ def main() -> int:
         return cmd_unpack(args.vbf, args.workspace, args.verbose, args.ignore_crc)
     elif args.command == "pack":
         return cmd_pack(args.workspace, args.output,
-                        getattr(args, "vbf_source", None), args.verbose, args.ignore_crc)
+                        getattr(args, "vbf_source", None), args.verbose, args.ignore_crc,
+                        dither=not args.no_dither)
     else:
         parser.print_help()
         return 0
