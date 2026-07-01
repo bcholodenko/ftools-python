@@ -25,7 +25,6 @@ from pathlib import Path
 from PIL import Image
 
 from . import bmpio
-from .crc import crc16_ccitt_false
 from .utils import read_file, write_file
 
 EIF_SIGNATURE = b"EBD\x10EIF"
