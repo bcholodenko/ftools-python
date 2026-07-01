@@ -36,25 +36,39 @@ ROW PADDING ("real width" / "real height"):
     image: realWidth columns by realHeight rows, where only the
     top-left width x height rectangle is the visible picture.
         realWidth  = the smallest value in [16,32,64,128,256,512,1024]
-                     that is >= width            (format != 2)
-                   = ceil(width / 4) * 4          (format == 2 only)
+                     that is >= width            (format != 2, graphics-
+                                                   VBF imagefs files - the
+                                                   "bitmaps" convention)
+                   = smallest power of 2 >= width (format != 2, EXE-VBF
+                                                   efs.bin files - the
+                                                   "efs" convention; no
+                                                   minimum of 16, and two
+                                                   specific named files
+                                                   override this - see
+                                                   _EFS_REALWIDTH_OVERRIDES)
+                   = ceil(width / 4) * 4          (format == 2 only, both
+                                                   conventions)
         realHeight = derived from the file size (see _raw_real_height())
                      for the 3 raw variants, or simply equal to the
                      declared height for the 2 RLE variants.
     A mask/alpha plane, when present, uses its own row width:
         maskWidth  = ceil(realWidth / 8) * 8
+    Which convention applies is a property of which container the file
+    came from, not of the file itself - decode_ddb()/encode_ddb()/
+    is_supported_ddb() take it as the width_convention parameter
+    ("bitmaps", the default, or "efs"). See _real_width() for detail.
 
 THE 5 FORMAT VALUES (byte at header offset 6 encodes two flags):
     rle  = (format % 2) != 0       (odd  -> PackBits-compressed)
     mask = format in (2, 6, 7)     (has a separate alpha/mask plane)
 
-    format  rle    mask   realWidth rule
-    ------  -----  -----  ------------------
-    4       False  False  pow2-list
-    6       False  True   pow2-list
-    2       False  True   ceil(w/4)*4
-    5       True   False  pow2-list
-    7       True   True   pow2-list
+    format  rle    mask   realWidth rule (within whichever convention
+    ------  -----  -----  applies - see ROW PADDING above)
+    4       False  False  pow2-list (bitmaps) / plain pow2 (efs)
+    6       False  True   pow2-list (bitmaps) / plain pow2 (efs)
+    2       False  True   ceil(w/4)*4, same in both conventions
+    5       True   False  pow2-list (bitmaps) / plain pow2 (efs)
+    7       True   True   pow2-list (bitmaps) / plain pow2 (efs)
 
 LAYOUT WITHIN THE FILE BODY (everything after the 8-byte header):
     No mask  (format 4, 5):       [color plane]
@@ -132,13 +146,67 @@ def _parse_header(data: bytes, context: str = "") -> dict:
     }
 
 
-def _real_width(fmt: int, width: int) -> int:
+# Two known, named exceptions to the "efs" convention's realWidth formula,
+# found by cross-checking every entry in the reference tool's own static
+# per-file metadata table (the one it uses instead of computing realWidth
+# from width, for files inside an EXE-VBF's efs.bin) against the formula
+# below. Confirmed: every other entry in that table (468 real files) matches
+# the formula exactly; only these two don't, and both look like one-off
+# manual overrides in a hand-maintained table rather than evidence of a
+# third general rule. Since the reference tool's own static table is the
+# thing real hardware was actually built against, these two filenames are
+# special-cased here rather than left to silently compute the wrong row
+# stride - especially important for the RLE one (c489_backup_slot.ddb),
+# where a wrong realWidth has no other validation to catch it (unlike the
+# raw formats, where _raw_real_height() at least has a chance to notice the
+# file size doesn't divide evenly and raise instead of silently corrupting).
+_EFS_REALWIDTH_OVERRIDES = {
+    "c489_backup_slot.ddb": 256,       # formula would give 128 (width=95)
+    "das_TJA_grey_dash_6_.ddb": 16,    # formula would give 4   (width=3)
+}
+
+
+def _real_width(fmt: int, width: int, convention: str = "bitmaps", context: str = "") -> int:
+    """`convention` distinguishes the two real-width rules observed in the
+    wild for non-format-2 images:
+      - "bitmaps" (default): smallest of the fixed list (16,32,...,1024)
+        that's >= width. This is what every file in a graphics-VBF
+        ("bitmaps.bin"-style) imagefs uses, and what this module has
+        always assumed.
+      - "efs": the mathematically simpler "smallest power of 2 >= width",
+        with no minimum of 16 - i.e. a width of 3 gets realWidth 4, not
+        16. This is what files inside an EXE-VBF's "efs.bin" container
+        use instead (see ftools_lib/efs.py) - same pixel format and
+        per-format rules otherwise, just a different width rounding rule
+        for this one part. Confirmed against 468 known real files; only
+        handles widths that fit in 16 bits, same as the format itself.
+
+    `context` (typically a file path or name) is checked against
+    _EFS_REALWIDTH_OVERRIDES when convention=="efs" - see that dict's
+    comment. Matching is by suffix, so a full path or a bare filename both
+    work; pass "" (the default) if the caller has no name to give, which
+    just means those two specific files won't get their override applied.
+    """
+    if convention == "efs" and context:
+        for name, override in _EFS_REALWIDTH_OVERRIDES.items():
+            if context.endswith(name):
+                return override
     if fmt == 2:
         return ((width + 3) // 4) * 4
+    if convention == "efs":
+        w = 1
+        while w < width:
+            w *= 2
+        return w
     for w in _POW2_WIDTHS:
         if w >= width:
             return w
-    raise DdbError(f"width {width} exceeds the largest supported real-width candidate (1024).")
+    raise DdbError(
+        f"width {width} exceeds 1024, the largest row width this format supports. "
+        f"This isn't a tool limitation - it mirrors the same lookup table the real "
+        f"IPC firmware uses internally, so a wider image likely couldn't be shown "
+        f"correctly on real hardware even if a file could be built for it."
+    )
 
 
 def _mask_width(real_width: int) -> int:
@@ -346,10 +414,85 @@ def _rgb_to_word(r: int, g: int, b: int) -> int:
     return ((r5 & 0x1F) << 10) | ((g5 & 0x1F) << 5) | (b5 & 0x1F)
 
 
+def dither_rgb_to_5bit(rgba: bytes, width: int, height: int) -> list:
+    """Floyd-Steinberg dithered quantization of the R/G/B channels (alpha
+    ignored - callers handle that separately, since how alpha is stored
+    is format-specific) from 8-bit to 5-bit per channel, row-major
+    top-down order. Returns a flat list of `width*height` (r5,g5,b5)
+    tuples.
+
+    5-bit-per-channel color only has 32 levels per channel, so a smooth
+    gradient quantized without dithering shows visible banding; this
+    breaks that up by diffusing each pixel's rounding error into its
+    not-yet-processed neighbors (right, bottom-left, bottom,
+    bottom-right, with the standard 7/3/5/1-sixteenths weights).
+
+    Shared by encode_ddb() and png_to_bmp_a1r5g5b5.py specifically so
+    both apply identical dithering - this is the single source of truth
+    for that algorithm, not a copy of it.
+
+    For a pixel whose 8-bit value already sits exactly on the 5-bit
+    quantization grid (e.g. read back from a never-edited decode_ddb()
+    PNG), the rounding error is exactly zero, so nothing gets diffused
+    to its neighbors - dithering an entirely unedited image is a no-op,
+    only edited regions (and pixels near them) are actually affected.
+    """
+    data = list(rgba)
+    out = [None] * (width * height)
+    for y in range(height):
+        for x in range(width):
+            idx = (y * width + x) * 4
+            r = max(0, min(255, data[idx]))
+            g = max(0, min(255, data[idx + 1]))
+            b = max(0, min(255, data[idx + 2]))
+
+            r5 = max(0, min(31, int(r * 31 / 255 + 0.5)))
+            g5 = max(0, min(31, int(g * 31 / 255 + 0.5)))
+            b5 = max(0, min(31, int(b * 31 / 255 + 0.5)))
+            out[y * width + x] = (r5, g5, b5)
+
+            r8 = round(r5 * _CHANNEL_SCALE)
+            g8 = round(g5 * _CHANNEL_SCALE)
+            b8 = round(b5 * _CHANNEL_SCALE)
+            err_r = r - r8
+            err_g = g - g8
+            err_b = b - b8
+
+            if err_r or err_g or err_b:
+                if x + 1 < width:
+                    n = idx + 4
+                    data[n] += err_r * 0.4375
+                    data[n + 1] += err_g * 0.4375
+                    data[n + 2] += err_b * 0.4375
+                if x - 1 >= 0 and y + 1 < height:
+                    n = ((y + 1) * width + x - 1) * 4
+                    data[n] += err_r * 0.1875
+                    data[n + 1] += err_g * 0.1875
+                    data[n + 2] += err_b * 0.1875
+                if y + 1 < height:
+                    n = ((y + 1) * width + x) * 4
+                    data[n] += err_r * 0.3125
+                    data[n + 1] += err_g * 0.3125
+                    data[n + 2] += err_b * 0.3125
+                if x + 1 < width and y + 1 < height:
+                    n = ((y + 1) * width + x + 1) * 4
+                    data[n] += err_r * 0.0625
+                    data[n + 1] += err_g * 0.0625
+                    data[n + 2] += err_b * 0.0625
+    return out
+
+
 # ── public API ──────────────────────────────────────────────────────────────────
 
-def is_supported_ddb(data: bytes) -> bool:
-    """Return True if `data` is a decodable .ddb file."""
+def is_supported_ddb(data: bytes, width_convention: str = "bitmaps", context: str = "") -> bool:
+    """Return True if `data` is a decodable .ddb file. `width_convention`
+    matters because it changes the expected size of the file - see
+    _real_width(). Pass `context` (the file's path or name) when known and
+    width_convention=="efs" so the two named realWidth exceptions in
+    _EFS_REALWIDTH_OVERRIDES get applied here too, not just in decode_ddb()/
+    encode_ddb() - otherwise this check would validate against the wrong
+    (formula) realWidth for those two files and could wrongly report them
+    as unsupported."""
     try:
         hdr = _parse_header(data)
     except DdbError:
@@ -357,7 +500,7 @@ def is_supported_ddb(data: bytes) -> bool:
     if hdr["format"] not in (2, 4, 5, 6, 7):
         return False
     try:
-        s = _real_width(hdr["format"], hdr["width"])
+        s = _real_width(hdr["format"], hdr["width"], width_convention, context)
         if not hdr["rle"]:
             _raw_real_height(hdr["format"], hdr["width"], hdr["height"], s, len(data))
         return True
@@ -365,11 +508,21 @@ def is_supported_ddb(data: bytes) -> bool:
         return False
 
 
-def decode_ddb(data: bytes, context: str = "<ddb data>") -> dict:
+def decode_ddb(data: bytes, context: str = "<ddb data>", width_convention: str = "bitmaps") -> dict:
     """Decode a .ddb buffer to RGBA pixel data.
 
     Returns {"width", "height", "rgba"} where rgba is width*height*4 bytes,
     top-down, R/G/B/A order, cropped to the visible width x height rectangle.
+
+    For width_convention=="efs", `context` doubles as the lookup key for
+    _EFS_REALWIDTH_OVERRIDES (matched by suffix) - pass the file's real
+    name/path here, not a generic placeholder, or the two named exceptions
+    won't get caught and this will silently decode with the wrong row
+    stride for those two specific files.
+
+    `width_convention` selects the realWidth rounding rule - "bitmaps"
+    (default) for files from a graphics-VBF's imagefs, "efs" for files
+    from an EXE-VBF's efs.bin container. See _real_width().
     """
     hdr = _parse_header(data, context)
     fmt, width, height = hdr["format"], hdr["width"], hdr["height"]
@@ -380,7 +533,7 @@ def decode_ddb(data: bytes, context: str = "<ddb data>") -> dict:
         )
 
     body = data[DDB_HEADER_SIZE:]
-    s = _real_width(fmt, width)
+    s = _real_width(fmt, width, width_convention, context)
     m = _mask_width(s)
 
     if hdr["rle"]:
@@ -431,7 +584,8 @@ def decode_ddb(data: bytes, context: str = "<ddb data>") -> dict:
 
 
 def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
-               context: str = "<ddb data>") -> bytes:
+               context: str = "<ddb data>", width_convention: str = "bitmaps",
+               dither: bool = True) -> bytes:
     """Re-encode RGBA pixel data back into .ddb format.
 
     Uses `original_data` (a real .ddb file) as a donor for the header
@@ -449,6 +603,21 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
     will naturally be a different length than the donor in this case.
 
     `rgba` must be width*height*4 bytes, top-down, R/G/B/A order.
+
+    `width_convention` selects the realWidth rounding rule - "bitmaps"
+    (default) for files from a graphics-VBF's imagefs, "efs" for files
+    from an EXE-VBF's efs.bin container. See _real_width(). For "efs",
+    `context` doubles as the _EFS_REALWIDTH_OVERRIDES lookup key (matched
+    by suffix) - pass the donor's real name/path, not a placeholder, or
+    the two named exceptions won't get caught.
+
+    `dither` (default True) applies the same Floyd-Steinberg dithering as
+    png_to_bmp_a1r5g5b5.py - see dither_rgb_to_5bit(). This is a no-op
+    for pixels that are already exactly representable in 5-bit color (in
+    particular, an entirely unedited decode_ddb() PNG round-trips
+    byte-identically either way), so leaving it on doesn't change
+    behavior for unedited files; it only changes how genuinely new or
+    edited pixel data gets quantized.
     """
     hdr = _parse_header(original_data, context)
     fmt = hdr["format"]
@@ -461,8 +630,9 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
 
     resized = (width != hdr["width"] or height != hdr["height"])
     body = original_data[DDB_HEADER_SIZE:]
-    s = _real_width(fmt, width)
+    s = _real_width(fmt, width, width_convention, context)
     m = _mask_width(s)
+
 
     if resized:
         # Fresh buffers at the new size - no donor pixel data carries over,
@@ -488,6 +658,7 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
             mask_plane[:] = body[color_target:color_target + mask_target]
 
     color_plane = bytearray(donor_color)
+    dithered = dither_rgb_to_5bit(rgba, width, height) if dither else None
     for row in range(height):
         c_row_off = row * s * 2
         m_row_off = row * m
@@ -496,7 +667,11 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
         for col in range(width):
             o = in_off + col * 4
             r, g, b, a = rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]
-            val = _rgb_to_word(r, g, b)
+            if dithered is not None:
+                r5, g5, b5 = dithered[row * width + col]
+                val = (r5 << 10) | (g5 << 5) | b5
+            else:
+                val = _rgb_to_word(r, g, b)
             if hdr["mask"]:
                 if not resized:
                     # bit15 is unused for transparency here but still stored;
@@ -531,23 +706,40 @@ def encode_ddb(original_data: bytes, rgba: bytes, width: int, height: int,
 
 # ── file-level helpers ────────────────────────────────────────────────────────
 
-def ddb_to_png_file(ddb_data: bytes, out_path, context: str = "") -> None:
-    """Decode a .ddb buffer and write a PNG file, preserving transparency."""
+def ddb_to_png_file(ddb_data: bytes, out_path, context: str = "",
+                     width_convention: str = "bitmaps") -> None:
+    """Decode a .ddb buffer and write a PNG file, preserving transparency.
+
+    `width_convention` - "bitmaps" (default) for files from a graphics-VBF's
+    imagefs, "efs" for files from an EXE-VBF's efs.bin container - see
+    _real_width() in this module. Pass `context` as the file's real name
+    when using "efs" so the two named realWidth exceptions get applied;
+    falling back to `out_path` (the default when context is empty) works
+    too as long as the output filename still matches the original name.
+    """
     from PIL import Image
-    decoded = decode_ddb(ddb_data, context=context or str(out_path))
+    decoded = decode_ddb(ddb_data, context=context or str(out_path),
+                         width_convention=width_convention)
     img = Image.frombytes("RGBA", (decoded["width"], decoded["height"]), decoded["rgba"])
     img.save(str(out_path), "PNG")
 
 
-def png_file_to_ddb_file(png_path, original_ddb_path, out_path) -> None:
+def png_file_to_ddb_file(png_path, original_ddb_path, out_path, dither: bool = True,
+                          width_convention: str = "bitmaps") -> None:
     """Read a PNG (including its alpha channel) and encode it back to
-    .ddb using the original as a donor for header/padding bytes."""
+    .ddb using the original as a donor for header/padding bytes.
+
+    `width_convention` - see ddb_to_png_file() above and _real_width() in
+    this module. `original_ddb_path` doubles as the realWidth-override
+    lookup key for "efs", so pass the file's real name, not a renamed copy.
+    """
     from PIL import Image
     img = Image.open(png_path).convert("RGBA")
     rgba = img.tobytes()
     original_data = read_file(original_ddb_path)
     new_ddb = encode_ddb(
         original_data, rgba, img.width, img.height,
-        context=str(original_ddb_path)
+        context=str(original_ddb_path), dither=dither,
+        width_convention=width_convention,
     )
     write_file(out_path, new_ddb)
